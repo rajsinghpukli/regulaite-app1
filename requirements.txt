@@ -1,0 +1,7 @@
+fastapi==0.116.1
+uvicorn==0.35.0
+openai>=1.40.0
+requests>=2.31.0
+pydantic>=2.7
+streamlit>=1.37.0
+gunicorn>=20.1.0
