@@ -1,44 +1,38 @@
-# rag/pipeline.py
-# minimal pipeline shim for the app
-# exposes constants expected by app.py:
-#   - PERSIST_DIR (string path)
-#   - TOP_K_DEFAULT (int)
-# and keeps the existing ask(...) bridge function.
-
 from pathlib import Path
-from typing import Any, Dict, Optional
+import os
 
-# relative imports used by your repo
 from .agents import ask_agent
 from .router import classify_intent_and_scope
 
-# ---------------------------------------------------------------------------
-# constants expected by app.py (exported names)
-# PERSIST_DIR: location where the app expects to persist vector DB / caches
-# TOP_K_DEFAULT: default "top k" for retrievals
-PERSIST_DIR = str(Path(__file__).parent / "persist")  # string path for compatibility
-TOP_K_DEFAULT = 5
-# ---------------------------------------------------------------------------
+# Keep this for compatibility with older UI / logs
+PERSIST_DIR = Path(__file__).parent / "persist"
+PERSIST_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def ask(q: str, include_web: bool = False, mode_hint: Optional[str] = None) -> Dict[str, Any]:
+def ask(
+    q: str,
+    include_web: bool = False,
+    mode_hint: str | None = None,
+    k: int = 5,
+    evidence_mode: bool = False,
+) -> str:
     """
-    Bridge function used by the web app.
-
-    Parameters
-    ----------
-    q : str
-        The user question text.
-    include_web : bool
-        Whether to include web search.
-    mode_hint : Optional[str]
-        Optional hint about which agent/mode to use.
-
-    Returns
-    -------
-    dict
-        Whatever ask_agent returns (keeps original behavior).
+    Main entrypoint the UI calls.
+    - q: question text
+    - include_web: if True, allow web search (not required if you only use vector store)
+    - mode_hint: optional override; otherwise we classify
+    - k: top-k retrieval size (fixed bug: now supported)
+    - evidence_mode: if True, ask for quotes/framework in style
     """
     route = classify_intent_and_scope(q, mode_hint)
-    resp = ask_agent(q, include_web=include_web, mode=route.get("intent"))
-    return resp
+
+    vector_store_id = os.getenv("OPENAI_VECTOR_STORE", "").strip() or None
+
+    return ask_agent(
+        q=q,
+        include_web=include_web,
+        mode=route.get("intent"),
+        k=k,
+        vector_store_id=vector_store_id,
+        evidence_mode=evidence_mode,
+    )
