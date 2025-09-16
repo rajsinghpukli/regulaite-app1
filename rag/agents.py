@@ -1,112 +1,58 @@
+from __future__ import annotations
 import os
-from typing import Optional
+from typing import List, Dict, Any
+from .router import length_directive
 
-try:
-    # OpenAI >= 1.x
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+DEFAULT_PLAN = """You are RegulAIte, a regulatory RAG assistant for Khaleeji Bank.
+Answer ONLY from (a) the attached OpenAI Vector Store (IFRS, AAOIFI, CBB, Internal policies),
+and (b) web search when explicitly enabled. If a framework cannot be evidenced, mark it
+`not_found`. NEVER invent citations.
 
-DEFAULT_RESPONSES_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4o-mini")
+Output MUST follow the provided JSON schema exactly (structured output), with these rules:
+- Fill the canonical 9 sections (Summary, per_source, Comparative analysis, Recommendation,
+  General knowledge, Gaps/Next steps, Citations, AI opinion, Follow-up suggestions).
+- Evidence mode: Provide 2–5 short verbatim quotes **per framework** that you mark as `addressed`,
+  each with a source citation (filename:page or URL). If <2 quotes for a framework, set status
+  to `not_found` and provide a note why.
+- Use short quotes (1–3 sentences). No ultra-long blocks.
+- Comparative analysis should highlight differences across IFRS vs AAOIFI vs CBB clearly.
+- Follow-up suggestions: 4–6 actionable, clickable questions that a Khaleeji CRO might ask next.
+"""
 
-
-def _make_client() -> Optional["OpenAI"]:
-    if not OpenAI:
-        return None
-    try:
-        return OpenAI()
-    except Exception:
-        return None
-
-
-def _to_text_from_responses(resp) -> str:
-    """
-    Best effort extraction for the Responses API across versions.
-    """
-    # Newer SDKs expose output_text
-    if hasattr(resp, "output_text") and resp.output_text:
-        return resp.output_text
-
-    # Some versions embed 'output' items
-    if hasattr(resp, "output") and resp.output:
-        parts = []
-        for item in resp.output:
-            piece = getattr(item, "content", None) or getattr(item, "text", None)
-            if isinstance(piece, str):
-                parts.append(piece)
-        if parts:
-            return "\n".join(parts)
-
-    # Generic fallback
-    return "Sorry, I couldn't produce a response."
-
-
-def ask_agent(
-    q: str,
-    include_web: bool,
-    mode: Optional[str],
-    k: int = 5,
-    vector_store_id: Optional[str] = None,
-    evidence_mode: bool = False,
+def build_system_instruction(
+    k_hint: int,
+    evidence_mode: bool,
+    mode: str,
+    org_tone: str = "professional, direct, bank-grade clarity"
 ) -> str:
+    ev = "Evidence mode is ON (2–5 quotes per framework)" if evidence_mode else \
+         "Evidence mode is OFF; still cite sources when used."
+    size = length_directive(mode)
+    return f"""{DEFAULT_PLAN}
+
+House rules:
+- Tone: {org_tone}.
+- Top-K hint for file search: {k_hint}.
+- {ev}
+- {size}
+- If query is ambiguous, briefly state assumptions and proceed.
+
+Safety:
+- If a requested topic concerns confidential policies not present in the vector store, explain that you cannot confirm and suggest providing the official document."""
+    
+def history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     """
-    Core agent logic:
-    - Prefer the Responses API with file_search to use your OpenAI vector store.
-    - Falls back to Chat Completions if Responses is not available.
+    Compress last turns into a lightweight running brief.
     """
-    client = _make_client()
-    if not client:
-        return "OpenAI SDK not available. Please ensure the `openai` package is installed."
-
-    # Compose system + user instructions
-    sys = (
-        "You are a precise financial policy assistant. "
-        "Answer concisely and cite from retrieved sources when available. "
-        "If the user enabled evidence mode, include 2–5 short quotes with source hints."
-    )
-
-    mode_note = f"(mode: {mode})" if mode else "(mode: auto)"
-    web_note = "with web search allowed" if include_web else "without web search"
-    user = f"{mode_note} {web_note}.\n\nUser question:\n{q}\n"
-
-    if evidence_mode:
-        user += "\nReturn 2–5 short, relevant quotes or references (file name/page) if possible."
-
-    # Try the Responses API with file_search tool
-    tools = []
-    tool_resources = None
-    if vector_store_id:
-        tools = [{"type": "file_search"}]
-        # Acceptable across API variants; ignored if unsupported
-        tool_resources = {
-            "file_search": {
-                "vector_store_ids": [vector_store_id],
-                "max_num_results": int(k),
-                "ranking_options": {"max_results": int(k)},
-            }
-        }
-
-    try:
-        resp = client.responses.create(
-            model=DEFAULT_RESPONSES_MODEL,
-            input=user,
-            tools=tools or None,
-            tool_resources=tool_resources or None,
-            # Some SDKs support 'system' in responses; harmless if ignored by others
-            system=sys,
-        )
-        return _to_text_from_responses(resp)
-    except Exception:
-        # Graceful fallback to Chat Completions (no file_search)
-        try:
-            chat = client.chat.completions.create(
-                model=DEFAULT_RESPONSES_MODEL,
-                messages=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-            )
-            return chat.choices[0].message.content
-        except Exception as e2:
-            return f"Model error: {e2}"
+    turns = history[-(max_pairs*2):]
+    lines = []
+    for h in turns:
+        role = h.get("role")
+        content = h.get("content", "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"User asked: {content}")
+        else:
+            lines.append(f"Assistant replied (summary/extract): {content[:600]}")
+    return "\n".join(lines[-(max_pairs*2):])
