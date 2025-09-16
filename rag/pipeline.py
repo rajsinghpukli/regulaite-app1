@@ -4,7 +4,7 @@ import os
 from .agents import ask_agent
 from .router import classify_intent_and_scope
 
-# Keep this for compatibility with older UI / logs
+# Keep this for compatibility with your UI references
 PERSIST_DIR = Path(__file__).parent / "persist"
 PERSIST_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -17,22 +17,20 @@ def ask(
     evidence_mode: bool = False,
 ) -> str:
     """
-    Main entrypoint the UI calls.
-    - q: question text
-    - include_web: if True, allow web search (not required if you only use vector store)
-    - mode_hint: optional override; otherwise we classify
-    - k: top-k retrieval size (fixed bug: now supported)
-    - evidence_mode: if True, ask for quotes/framework in style
+    Main pipeline entrypoint used by app.py.
+
+    - Supports `k` (Top-K) and `evidence_mode`.
+    - Will use OPENAI_VECTOR_STORE if provided.
     """
     route = classify_intent_and_scope(q, mode_hint)
-
     vector_store_id = os.getenv("OPENAI_VECTOR_STORE", "").strip() or None
 
+    # IMPORTANT: pass positional args to avoid mismatches on older servers
     return ask_agent(
-        q=q,
-        include_web=include_web,
-        mode=route.get("intent"),
-        k=k,
-        vector_store_id=vector_store_id,
-        evidence_mode=evidence_mode,
+        q,
+        include_web,
+        route.get("intent"),
+        k,
+        vector_store_id,
+        evidence_mode,
     )
