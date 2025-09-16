@@ -3,15 +3,85 @@ import streamlit as st
 
 from rag.pipeline import ask, PERSIST_DIR
 
-# ---------- UI CONFIG ----------
+
+# ------------------------------
+# AUTH / LOGIN
+# ------------------------------
+def _login_required() -> bool:
+    """
+    Returns True if the app should enforce login.
+    Toggle with LOGIN_REQUIRED env var (default: True).
+    """
+    val = os.getenv("LOGIN_REQUIRED", "true").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _check_login_gate() -> None:
+    """
+    A very simple password gate:
+    - Set env APP_PASSWORD (or STREAMLIT_PASSWORD) to require login.
+    - Use LOGIN_REQUIRED=false to disable this gate.
+    """
+    if not _login_required():
+        st.session_state["authed"] = True
+        return
+
+    required_password = os.getenv("APP_PASSWORD") or os.getenv("STREAMLIT_PASSWORD")
+    if not required_password:
+        # If no password is set, let the user in with a warning
+        st.session_state["authed"] = True
+        st.sidebar.info("APP_PASSWORD not set — login gate is disabled.")
+        return
+
+    if st.session_state.get("authed"):
+        # already logged in
+        return
+
+    st.markdown(
+        "<h2 style='text-align:center;margin-top:3rem;'>RegulaiTE — Login</h2>",
+        unsafe_allow_html=True,
+    )
+    with st.form("login"):
+        st.write("Please enter your password to continue.")
+        pwd = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+        if submitted:
+            if pwd == required_password:
+                st.session_state["authed"] = True
+                st.experimental_rerun()
+            else:
+                st.error("Incorrect password.")
+
+
+# ------------------------------
+# PAGE CONFIG
+# ------------------------------
 st.set_page_config(
     page_title="RegulaiTE — RAG Assistant",
     page_icon="🤖",
     layout="wide",
 )
 
-st.title("RegulaiTE — RAG Assistant")
+# GATE
+_check_login_gate()
+if not st.session_state.get("authed"):
+    st.stop()
 
+
+# ------------------------------
+# HEADER
+# ------------------------------
+st.markdown(
+    """
+    <h1 style="margin-top:0.2rem;margin-bottom:0.4rem;">RegulaiTE — RAG Assistant</h1>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ------------------------------
+# SIDEBAR SETTINGS
+# ------------------------------
 with st.sidebar:
     st.header("Settings")
 
@@ -26,18 +96,25 @@ with st.sidebar:
         st.success(f"Vector store: connected\n\n**id:** `{vs_id}`")
     else:
         st.error("Vector store: not set")
-        st.caption(f"Fallback local label: `{PERSIST_DIR.as_posix()}`")
+        st.caption(f"Local fallback label: `{PERSIST_DIR.as_posix()}`")
 
-    api_key_present = bool(os.getenv("OPENAI_API_KEY"))
-    if api_key_present:
+    if os.getenv("OPENAI_API_KEY"):
         st.success("LLM API key: available")
     else:
         st.error("LLM API key: missing (set OPENAI_API_KEY)")
 
-# ---------- MAIN INPUT ----------
+    if _login_required():
+        if st.button("Logout"):
+            st.session_state.clear()
+            st.experimental_rerun()
+
+
+# ------------------------------
+# MAIN INPUT
+# ------------------------------
 query = st.text_input(
     "Ask a question",
-    placeholder="How do we classify and measure sukuk held to maturity under IFRS 9 vs AAOIFI?",
+    placeholder="“Main features of capital instruments” — identify the disclosure template; give 2–3 short quotes with file name and page.",
 )
 
 col1, col2 = st.columns([1, 3])
@@ -50,21 +127,24 @@ with col2:
         index=0,
     )
 
-if st.button("Ask", type="primary") and query.strip():
-    with st.spinner("Thinking…"):
-        try:
-            answer = ask(
-                query,
+# Call
+if st.button("Ask", type="primary"):
+    if not query.strip():
+        st.warning("Please enter a question.")
+    else:
+        with st.spinner("Thinking…"):
+            # Call pipeline.ask; now supports k and evidence_mode
+            result = ask(
+                query.strip(),
                 include_web=include_web,
-                mode_hint=None if mode_hint == "auto" else mode_hint,
-                k=top_k,  # IMPORTANT: UI passes k (now supported)
+                mode_hint=(None if mode_hint == "auto" else mode_hint),
+                k=top_k,
                 evidence_mode=evidence_mode,
             )
-        except TypeError as e:
-            # If you ever see this, your local deploy is out-of-sync. But we guard anyway.
-            answer = f"Error: {e}"
 
-    if isinstance(answer, str):
-        st.write(answer)
-    else:
-        st.write(str(answer))
+        # Normalize output
+        st.markdown("### Answer")
+        if isinstance(result, str):
+            st.write(result)
+        else:
+            st.write(str(result))
