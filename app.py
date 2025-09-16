@@ -1,150 +1,157 @@
-import os
+from __future__ import annotations
+import os, time
 import streamlit as st
+from dotenv import load_dotenv
+from typing import List, Dict
+from rag.pipeline import ask
+from rag.persist import load_chat, save_chat, append_turn, clear_chat
+from rag.schema import RegulAIteAnswer
 
-from rag.pipeline import ask, PERSIST_DIR
+load_dotenv()  # allow .env locally
 
+# -------- ENV / CONFIG --------
+APP_NAME = "RegulaiTE — RAG Assistant"
+DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
+VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
+BASIC_USER = os.getenv("BASIC_USER", "raj")
+BASIC_PASS = os.getenv("BASIC_PASS", "pass")  # set real secrets in Azure!
+THEME_HINT = os.getenv("REG_THEME", "professional-colorful")
+LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
-# ------------------------------
-# AUTH / LOGIN
-# ------------------------------
-def _login_required() -> bool:
-    """
-    Returns True if the app should enforce login.
-    Toggle with LOGIN_REQUIRED env var (default: True).
-    """
-    val = os.getenv("LOGIN_REQUIRED", "true").strip().lower()
-    return val in ("1", "true", "yes", "on")
+st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
+# --------- AUTH ---------
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
 
-def _check_login_gate() -> None:
-    """
-    A very simple password gate:
-    - Set env APP_PASSWORD (or STREAMLIT_PASSWORD) to require login.
-    - Use LOGIN_REQUIRED=false to disable this gate.
-    """
-    if not _login_required():
-        st.session_state["authed"] = True
-        return
-
-    required_password = os.getenv("APP_PASSWORD") or os.getenv("STREAMLIT_PASSWORD")
-    if not required_password:
-        # If no password is set, let the user in with a warning
-        st.session_state["authed"] = True
-        st.sidebar.info("APP_PASSWORD not set — login gate is disabled.")
-        return
-
-    if st.session_state.get("authed"):
-        # already logged in
-        return
-
-    st.markdown(
-        "<h2 style='text-align:center;margin-top:3rem;'>RegulaiTE — Login</h2>",
-        unsafe_allow_html=True,
-    )
+def login_ui():
     with st.form("login"):
-        st.write("Please enter your password to continue.")
-        pwd = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-        if submitted:
-            if pwd == required_password:
-                st.session_state["authed"] = True
-                st.experimental_rerun()
+        st.markdown("### Sign in")
+        u = st.text_input("Username", value=st.session_state.user_id or "")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Sign in")
+        if ok:
+            if (u == BASIC_USER) and (p == BASIC_PASS):
+                st.session_state.auth_ok = True
+                st.session_state.user_id = u
+                st.success("Signed in")
+                st.rerun()
             else:
-                st.error("Incorrect password.")
+                st.error("Invalid credentials")
 
-
-# ------------------------------
-# PAGE CONFIG
-# ------------------------------
-st.set_page_config(
-    page_title="RegulaiTE — RAG Assistant",
-    page_icon="🤖",
-    layout="wide",
-)
-
-# GATE
-_check_login_gate()
-if not st.session_state.get("authed"):
+if not st.session_state.auth_ok:
+    login_ui()
     st.stop()
 
+USER = st.session_state.user_id
 
-# ------------------------------
-# HEADER
-# ------------------------------
-st.markdown(
-    """
-    <h1 style="margin-top:0.2rem;margin-bottom:0.4rem;">RegulaiTE — RAG Assistant</h1>
-    """,
-    unsafe_allow_html=True,
-)
+# --------- STATE ---------
+if "history" not in st.session_state:
+    st.session_state.history = load_chat(USER)  # hydrate from disk
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = None  # RegulAIteAnswer or None
 
-
-# ------------------------------
-# SIDEBAR SETTINGS
-# ------------------------------
+# --------- SIDEBAR ---------
 with st.sidebar:
     st.header("Settings")
+    k_hint = st.slider("Top-K hint", min_value=3, max_value=12, value=5, step=1)
+    evidence_mode = st.toggle("Evidence Mode (2–5 quotes/framework)", value=True)
+    web_enabled = st.toggle("Web search (beta)", value=False)
+    mode_hint = st.selectbox("Mode hint (optional)", ["auto", "short", "long", "research"], index=0)
 
-    top_k = st.slider("Top-K hint", min_value=1, max_value=10, value=5)
-    evidence_mode = st.toggle("Evidence Mode (2–5 quotes/framework)", value=False)
+    st.markdown("---")
+    st.header("System status")
+    vs_status = "connected" if VECTOR_STORE_ID else "not connected"
+    st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
+    st.caption("id:")
+    st.code(VECTOR_STORE_ID or "(none)", language="text")
+    st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
-    st.divider()
-    st.subheader("System status")
+    st.markdown("---")
+    if st.button("Clear conversation"):
+        clear_chat(USER)
+        st.session_state.history = []
+        st.session_state.last_answer = None
+        st.rerun()
 
-    vs_id = os.getenv("OPENAI_VECTOR_STORE", "").strip()
-    if vs_id:
-        st.success(f"Vector store: connected\n\n**id:** `{vs_id}`")
+# --------- HEADER ---------
+st.markdown(f"## {APP_NAME}")
+
+# Sticky compose bar (simple version in main col)
+query = st.text_input("Ask a question", placeholder="e.g., Guidelines for Completion of Exposures to Connected Counterparties…")
+
+cols = st.columns([1,1,6])
+with cols[0]:
+    ask_clicked = st.button("Ask", type="primary", use_container_width=True)
+with cols[1]:
+    paste_example = st.button("Example", use_container_width=True)
+
+if paste_example:
+    query = "Provide IFRS vs AAOIFI vs CBB guidance on connected counterparty exposures: risk limits, approvals, reporting, and completion/closure controls. Include evidence."
+
+# --------- CHAT HISTORY RENDER ---------
+for turn in st.session_state.history:
+    if turn["role"] == "user":
+        st.chat_message("user").write(turn["content"])
     else:
-        st.error("Vector store: not set")
-        st.caption(f"Local fallback label: `{PERSIST_DIR.as_posix()}`")
+        st.chat_message("assistant").write(turn["content"])
 
-    if os.getenv("OPENAI_API_KEY"):
-        st.success("LLM API key: available")
-    else:
-        st.error("LLM API key: missing (set OPENAI_API_KEY)")
+# --------- FOLLOW-UP CHIPS (from last answer) ---------
+if isinstance(st.session_state.last_answer, RegulAIteAnswer):
+    suggs = st.session_state.last_answer.follow_up_suggestions or []
+    if suggs:
+        st.caption("Try a follow-up:")
+        chip_cols = st.columns(3)
+        for i, s in enumerate(suggs[:6]):
+            with chip_cols[i % 3]:
+                if st.button(s, key=f"chip_{i}", use_container_width=True):
+                    query = s
+                    ask_clicked = True
 
-    if _login_required():
-        if st.button("Logout"):
-            st.session_state.clear()
-            st.experimental_rerun()
+# --------- HANDLE ASK ---------
+def run_query(q: str):
+    if not q.strip():
+        return
+    # save user turn
+    append_turn(USER, "user", q)
+    st.session_state.history.append({"role": "user", "content": q})
+    save_chat(USER, st.session_state.history)
 
+    with st.spinner("Thinking…"):
+        ans = ask(
+            q,
+            user_id=USER,
+            history=st.session_state.history,
+            k_hint=k_hint,
+            evidence_mode=evidence_mode,
+            mode_hint=mode_hint,
+            web_enabled=web_enabled,
+            vec_id=VECTOR_STORE_ID or None,
+            model=DEFAULT_MODEL,
+        )
+    md = ans.as_markdown().strip() or "_No answer produced._"
 
-# ------------------------------
-# MAIN INPUT
-# ------------------------------
-query = st.text_input(
-    "Ask a question",
-    placeholder="“Main features of capital instruments” — identify the disclosure template; give 2–3 short quotes with file name and page.",
-)
+    append_turn(USER, "assistant", md)
+    st.session_state.history.append({"role": "assistant", "content": md})
+    st.session_state.last_answer = ans
+    save_chat(USER, st.session_state.history)
 
-col1, col2 = st.columns([1, 3])
-with col1:
-    include_web = st.toggle("Web search (beta)", value=False)
-with col2:
-    mode_hint = st.selectbox(
-        "Mode hint (optional)",
-        ["auto", "policy", "accounting", "finance", "other"],
-        index=0,
+    st.chat_message("assistant").write(md)
+
+if ask_clicked:
+    run_query(query)
+
+# --------- FOOTER / NOTES ---------
+with st.expander("Notes / Help", expanded=False):
+    st.markdown(
+        """
+- **Login:** set `BASIC_USER` and `BASIC_PASS` in your App Service settings.
+- **Vector store:** set `OPENAI_VECTOR_STORE_ID` to your OpenAI VS id (e.g., `vs_...`).
+- **Model:** override with `RESPONSES_MODEL` (default: `gpt-4.1-mini`).
+- **Evidence mode:** forces 2–5 verbatim quotes per addressed framework; if fewer than 2, status is downgraded to `not_found`.
+- **Memory:** conversation is saved per user at `rag/persist/chats/<user>.json`.
+- **Style:** UI keeps your canonical requirements (sticky composer, colorful theme hint, follow-up chips).
+        """
     )
-
-# Call
-if st.button("Ask", type="primary"):
-    if not query.strip():
-        st.warning("Please enter a question.")
-    else:
-        with st.spinner("Thinking…"):
-            # Call pipeline.ask; now supports k and evidence_mode
-            result = ask(
-                query.strip(),
-                include_web=include_web,
-                mode_hint=(None if mode_hint == "auto" else mode_hint),
-                k=top_k,
-                evidence_mode=evidence_mode,
-            )
-
-        # Normalize output
-        st.markdown("### Answer")
-        if isinstance(result, str):
-            st.write(result)
-        else:
-            st.write(str(result))
