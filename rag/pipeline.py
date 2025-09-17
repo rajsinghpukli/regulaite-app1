@@ -62,7 +62,6 @@ def _schema_dict() -> Dict[str, Any]:
     }
 
 def _schema_prompt_block() -> str:
-    # We enforce JSON via prompt so it works on any SDK version.
     return (
         "You MUST return a SINGLE JSON object that exactly matches this JSON Schema. "
         "Do not include any prose, markdown, or backticks—only the JSON object.\n\n"
@@ -70,7 +69,6 @@ def _schema_prompt_block() -> str:
     )
 
 def _parse_json_loose(text: str) -> Dict[str, Any]:
-    # Extract the first top-level JSON object from the text
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -78,21 +76,27 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
-        # Gentle cleanup in case of trailing commas
-        raw = re.sub(r",\s*}", "}", raw)
-        raw = re.sub(r",\s*]", "]", raw)
+        raw = re.sub(r",\\s*}", "}", raw)
+        raw = re.sub(r",\\s*]", "]", raw)
         try:
             return json.loads(raw)
         except Exception:
             return {}
 
 def _pick_chat_model(model: str | None) -> str:
-    # Some older SDKs/models only support Chat Completions well
     m = (model or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
-    # If a 4.1* model is provided (responses-first), fall back to 4o-mini for chat
     if "4.1" in m:
         return "gpt-4o-mini"
     return m
+
+def _mode_tokens(mode: str) -> int:
+    if mode == "short":
+        return 800
+    if mode == "long":
+        return 1800
+    if mode == "research":
+        return 3000
+    return 1200
 
 # ---------- Main entry -------------------------------------------------------
 def ask(
@@ -104,14 +108,13 @@ def ask(
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
     web_enabled: bool = False,
-    vec_id: Optional[str] = None,   # kept for API compatibility, not used on old SDKs
+    vec_id: Optional[str] = None,  # kept for compatibility; VS not used on older SDKs
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Chat-completions based implementation (no attachments/tools) for maximum SDK compatibility.
-    - Web search (beta): uses DuckDuckGo and passes top links as context.
-    - Vector store: requires OpenAI 'attachments' on Responses API; since your SDK rejects it,
-      we skip it here. Once your SDK is upgraded, we can re-enable that path.
+    Chat-completions implementation (SDK-safe). Vector store is skipped until your
+    SDK supports Responses attachments. Web search is used to add real snippets/links.
+    Mode (short/long/research) meaningfully changes length and structure.
     """
     mode = normalize_mode(mode_hint)
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
@@ -119,12 +122,16 @@ def ask(
 
     web_context = ""
     if web_enabled:
-        results = ddg_search(query, max_results=min(6, max(3, k_hint)))
+        results = ddg_search(query, max_results=min(8, max(4, k_hint)))
         if results:
-            lines = [f"{i+1}. {t} — {u}" for i, (t, u) in enumerate(results)]
-            web_context = "Relevant web links:\n" + "\n".join(lines)
+            # Provide snippets + URLs as model context
+            lines = ["Relevant web snippets (use for evidence if reliable):"]
+            for i, r in enumerate(results, 1):
+                snippet = (r["snippet"] or "").strip()
+                snippet = snippet[:350]
+                lines.append(f"{i}. {r['title']} — {r['url']}\n   Snippet: {snippet}")
+            web_context = "\n".join(lines)
 
-    # Build messages for Chat Completions
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": _schema_prompt_block()},
@@ -135,10 +142,12 @@ def ask(
     messages.append({"role": "user", "content": query})
 
     chat_model = _pick_chat_model(model)
+    max_tokens = _mode_tokens(mode)
 
     resp = client.chat.completions.create(
         model=chat_model,
         temperature=0.2,
+        max_tokens=max_tokens,
         messages=messages,
     )
 
