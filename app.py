@@ -1,26 +1,23 @@
 from __future__ import annotations
-import os, time
+import os
 import streamlit as st
 from dotenv import load_dotenv
-from typing import List, Dict
 from rag.pipeline import ask
 from rag.persist import load_chat, save_chat, append_turn, clear_chat
 from rag.schema import RegulAIteAnswer
 
-load_dotenv()  # allow .env locally
+load_dotenv()
 
-# -------- ENV / CONFIG --------
 APP_NAME = "RegulaiTE — RAG Assistant"
 DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 BASIC_USER = os.getenv("BASIC_USER", "raj")
-BASIC_PASS = os.getenv("BASIC_PASS", "pass")  # set real secrets in Azure!
-THEME_HINT = os.getenv("REG_THEME", "professional-colorful")
+BASIC_PASS = os.getenv("BASIC_PASS", "pass")
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
-# --------- AUTH ---------
+# -------- Auth --------
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "user_id" not in st.session_state:
@@ -47,13 +44,13 @@ if not st.session_state.auth_ok:
 
 USER = st.session_state.user_id
 
-# --------- STATE ---------
+# -------- State --------
 if "history" not in st.session_state:
-    st.session_state.history = load_chat(USER)  # hydrate from disk
+    st.session_state.history = load_chat(USER)
 if "last_answer" not in st.session_state:
-    st.session_state.last_answer = None  # RegulAIteAnswer or None
+    st.session_state.last_answer = None  # RegulAIteAnswer
 
-# --------- SIDEBAR ---------
+# -------- Sidebar --------
 with st.sidebar:
     st.header("Settings")
     k_hint = st.slider("Top-K hint", min_value=3, max_value=12, value=5, step=1)
@@ -63,7 +60,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("System status")
-    vs_status = "connected" if VECTOR_STORE_ID else "not connected"
     st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
     st.caption("id:")
     st.code(VECTOR_STORE_ID or "(none)", language="text")
@@ -76,29 +72,24 @@ with st.sidebar:
         st.session_state.last_answer = None
         st.rerun()
 
-# --------- HEADER ---------
+# -------- Main --------
 st.markdown(f"## {APP_NAME}")
 
-# Sticky compose bar (simple version in main col)
-query = st.text_input("Ask a question", placeholder="e.g., Guidelines for Completion of Exposures to Connected Counterparties…")
-
+query = st.text_input("Ask a question", placeholder="e.g., Connected counterparties completion/closure controls…")
 cols = st.columns([1,1,6])
 with cols[0]:
     ask_clicked = st.button("Ask", type="primary", use_container_width=True)
 with cols[1]:
     paste_example = st.button("Example", use_container_width=True)
-
 if paste_example:
     query = "Provide IFRS vs AAOIFI vs CBB guidance on connected counterparty exposures: risk limits, approvals, reporting, and completion/closure controls. Include evidence."
 
-# --------- CHAT HISTORY RENDER ---------
 for turn in st.session_state.history:
     if turn["role"] == "user":
         st.chat_message("user").write(turn["content"])
     else:
         st.chat_message("assistant").write(turn["content"])
 
-# --------- FOLLOW-UP CHIPS (from last answer) ---------
 if isinstance(st.session_state.last_answer, RegulAIteAnswer):
     suggs = st.session_state.last_answer.follow_up_suggestions or []
     if suggs:
@@ -110,11 +101,9 @@ if isinstance(st.session_state.last_answer, RegulAIteAnswer):
                     query = s
                     ask_clicked = True
 
-# --------- HANDLE ASK ---------
 def run_query(q: str):
     if not q.strip():
         return
-    # save user turn
     append_turn(USER, "user", q)
     st.session_state.history.append({"role": "user", "content": q})
     save_chat(USER, st.session_state.history)
@@ -143,15 +132,12 @@ def run_query(q: str):
 if ask_clicked:
     run_query(query)
 
-# --------- FOOTER / NOTES ---------
 with st.expander("Notes / Help", expanded=False):
     st.markdown(
         """
-- **Login:** set `BASIC_USER` and `BASIC_PASS` in your App Service settings.
-- **Vector store:** set `OPENAI_VECTOR_STORE_ID` to your OpenAI VS id (e.g., `vs_...`).
-- **Model:** override with `RESPONSES_MODEL` (default: `gpt-4.1-mini`).
-- **Evidence mode:** forces 2–5 verbatim quotes per addressed framework; if fewer than 2, status is downgraded to `not_found`.
-- **Memory:** conversation is saved per user at `rag/persist/chats/<user>.json`.
-- **Style:** UI keeps your canonical requirements (sticky composer, colorful theme hint, follow-up chips).
+- Set `BASIC_USER` / `BASIC_PASS` in App Service → Configuration.
+- Set `OPENAI_VECTOR_STORE_ID` to your `vs_...` id.
+- Change `RESPONSES_MODEL` if needed (default `gpt-4.1-mini`).
+- Chat memory is saved per user in `rag/persist/chats/<user>.json`.
         """
     )
