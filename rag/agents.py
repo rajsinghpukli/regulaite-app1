@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import List, Dict
 from .router import length_directive
 
 BASE_RULES = """You are RegulAIte, a regulatory RAG assistant for Khaleeji Bank (Bahrain).
@@ -70,3 +71,24 @@ House rules:
 
 When building the JSON, fill every field appropriately and ensure the object is valid JSON.
 """
+
+def history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
+    """
+    Compress recent turns into a short brief fed to the model.
+    Keeps up to `max_pairs` Q/A pairs (2*max_pairs turns).
+    """
+    if not history:
+        return ""
+    turns = history[-(max_pairs * 2):]
+    lines: List[str] = []
+    for h in turns:
+        role = h.get("role")
+        content = (h.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"User asked: {content}")
+        else:
+            # Keep a short extract of the assistant reply to avoid token bloat
+            lines.append(f"Assistant replied (extract): {content[:700]}")
+    return "\n".join(lines[-(max_pairs * 2):])
