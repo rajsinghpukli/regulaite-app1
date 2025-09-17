@@ -6,10 +6,11 @@ from pydantic import ValidationError
 from .schema import RegulAIteAnswer, DEFAULT_EMPTY
 from .agents import build_system_instruction, history_to_brief
 from .router import normalize_mode
+from .websearch import ddg_search
 
 client = OpenAI()
 
-# ----- JSON coercion helpers -------------------------------------------------
+# ---------- JSON schema + helpers -------------------------------------------
 def _per_source_schema() -> Dict[str, Any]:
     return {
         "type": "object",
@@ -61,23 +62,15 @@ def _schema_dict() -> Dict[str, Any]:
     }
 
 def _schema_prompt_block() -> str:
-    # We’ll *prompt* the model to return a single JSON object (no response_format arg).
+    # We enforce JSON via prompt so it works on any SDK version.
     return (
         "You MUST return a SINGLE JSON object that exactly matches this JSON Schema. "
         "Do not include any prose, markdown, or backticks—only the JSON object.\n\n"
         + json.dumps(_schema_dict(), ensure_ascii=False)
     )
 
-def _attachments(vec_id: Optional[str], k_hint: int) -> Optional[List[Dict[str, Any]]]:
-    if not vec_id:
-        return None
-    return [{
-        "vector_store_id": vec_id,
-        "file_search": {"max_num_results": int(k_hint)}
-    }]
-
 def _parse_json_loose(text: str) -> Dict[str, Any]:
-    # Extract the first top-level JSON object from text (robust to accidental pre/post text)
+    # Extract the first top-level JSON object from the text
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -85,6 +78,7 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
+        # Gentle cleanup in case of trailing commas
         raw = re.sub(r",\s*}", "}", raw)
         raw = re.sub(r",\s*]", "]", raw)
         try:
@@ -92,7 +86,15 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
         except Exception:
             return {}
 
-# ----- Main entry ------------------------------------------------------------
+def _pick_chat_model(model: str | None) -> str:
+    # Some older SDKs/models only support Chat Completions well
+    m = (model or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
+    # If a 4.1* model is provided (responses-first), fall back to 4o-mini for chat
+    if "4.1" in m:
+        return "gpt-4o-mini"
+    return m
+
+# ---------- Main entry -------------------------------------------------------
 def ask(
     query: str,
     *,
@@ -102,51 +104,49 @@ def ask(
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
     web_enabled: bool = False,
-    vec_id: Optional[str] = None,
+    vec_id: Optional[str] = None,   # kept for API compatibility, not used on old SDKs
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Call OpenAI Responses API (broad compatibility). We DO NOT pass response_format=
-    to avoid SDK version issues. Instead, we enforce JSON via prompt + regex parse.
+    Chat-completions based implementation (no attachments/tools) for maximum SDK compatibility.
+    - Web search (beta): uses DuckDuckGo and passes top links as context.
+    - Vector store: requires OpenAI 'attachments' on Responses API; since your SDK rejects it,
+      we skip it here. Once your SDK is upgraded, we can re-enable that path.
     """
-    model = model or os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
     mode = normalize_mode(mode_hint)
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
     convo_brief = history_to_brief(history)
 
-    tools = [{"type": "web_search"}] if web_enabled else None
-    attachments = _attachments(vec_id, k_hint)
+    web_context = ""
+    if web_enabled:
+        results = ddg_search(query, max_results=min(6, max(3, k_hint)))
+        if results:
+            lines = [f"{i+1}. {t} — {u}" for i, (t, u) in enumerate(results)]
+            web_context = "Relevant web links:\n" + "\n".join(lines)
 
-    # Important: NO response_format kwarg here (older SDKs choke on it).
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": sys_inst},
-            {"role": "system", "content": _schema_prompt_block()},
-            {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
-            {"role": "user", "content": query},
-        ],
-        tools=tools,
-        attachments=attachments,
-        metadata={"app": "RegulAIte", "user": user_id},
+    # Build messages for Chat Completions
+    messages = [
+        {"role": "system", "content": sys_inst},
+        {"role": "system", "content": _schema_prompt_block()},
+        {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
+    ]
+    if web_context:
+        messages.append({"role": "user", "content": web_context})
+    messages.append({"role": "user", "content": query})
+
+    chat_model = _pick_chat_model(model)
+
+    resp = client.chat.completions.create(
+        model=chat_model,
+        temperature=0.2,
+        messages=messages,
     )
 
-    # Try to extract text from various SDK shapes
-    text = getattr(resp, "output_text", None)
-    if not text:
-        try:
-            parts = []
-            for block in getattr(resp, "output", []):
-                for c in getattr(block, "content", []):
-                    if getattr(c, "type", None) == "output_text":
-                        parts.append(getattr(c, "text", {}).get("value", ""))
-            text = "\n".join(parts)
-        except Exception:
-            # Last resort: try the raw .model_dump_json()
-            try:
-                text = resp.model_dump_json()
-            except Exception:
-                text = ""
+    text = ""
+    try:
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        text = ""
 
     data = _parse_json_loose(text or "")
     if not data:
