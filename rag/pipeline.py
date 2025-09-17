@@ -9,6 +9,7 @@ from .router import normalize_mode
 
 client = OpenAI()
 
+# ----- JSON coercion helpers -------------------------------------------------
 def _per_source_schema() -> Dict[str, Any]:
     return {
         "type": "object",
@@ -32,36 +33,40 @@ def _per_source_schema() -> Dict[str, Any]:
         "additionalProperties": False,
     }
 
-def _json_schema() -> Dict[str, Any]:
+def _schema_dict() -> Dict[str, Any]:
     return {
-        "name": "RegulAIteAnswer",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string"},
-                "per_source": {
-                    "type": "object",
-                    "properties": {
-                        "IFRS": _per_source_schema(),
-                        "AAOIFI": _per_source_schema(),
-                        "CBB": _per_source_schema(),
-                        "InternalPolicy": _per_source_schema(),
-                    },
-                    "additionalProperties": False,
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "per_source": {
+                "type": "object",
+                "properties": {
+                    "IFRS": _per_source_schema(),
+                    "AAOIFI": _per_source_schema(),
+                    "CBB": _per_source_schema(),
+                    "InternalPolicy": _per_source_schema(),
                 },
-                "comparative_analysis": {"type": "string"},
-                "recommendation": {"type": "string"},
-                "general_knowledge": {"type": "string"},
-                "gaps_or_next_steps": {"type": "string"},
-                "citations": {"type": "array", "items": {"type": "string"}},
-                "ai_opinion": {"type": "string"},
-                "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
+                "additionalProperties": False,
             },
-            "required": ["summary", "per_source"],
-            "additionalProperties": False,
+            "comparative_analysis": {"type": "string"},
+            "recommendation": {"type": "string"},
+            "general_knowledge": {"type": "string"},
+            "gaps_or_next_steps": {"type": "string"},
+            "citations": {"type": "array", "items": {"type": "string"}},
+            "ai_opinion": {"type": "string"},
+            "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
         },
-        "strict": True,
+        "required": ["summary", "per_source"],
+        "additionalProperties": False,
     }
+
+def _schema_prompt_block() -> str:
+    # We’ll *prompt* the model to return a single JSON object (no response_format arg).
+    return (
+        "You MUST return a SINGLE JSON object that exactly matches this JSON Schema. "
+        "Do not include any prose, markdown, or backticks—only the JSON object.\n\n"
+        + json.dumps(_schema_dict(), ensure_ascii=False)
+    )
 
 def _attachments(vec_id: Optional[str], k_hint: int) -> Optional[List[Dict[str, Any]]]:
     if not vec_id:
@@ -72,6 +77,7 @@ def _attachments(vec_id: Optional[str], k_hint: int) -> Optional[List[Dict[str, 
     }]
 
 def _parse_json_loose(text: str) -> Dict[str, Any]:
+    # Extract the first top-level JSON object from text (robust to accidental pre/post text)
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -86,6 +92,7 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
         except Exception:
             return {}
 
+# ----- Main entry ------------------------------------------------------------
 def ask(
     query: str,
     *,
@@ -98,6 +105,10 @@ def ask(
     vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
+    """
+    Call OpenAI Responses API (broad compatibility). We DO NOT pass response_format=
+    to avoid SDK version issues. Instead, we enforce JSON via prompt + regex parse.
+    """
     model = model or os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
     mode = normalize_mode(mode_hint)
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
@@ -106,19 +117,21 @@ def ask(
     tools = [{"type": "web_search"}] if web_enabled else None
     attachments = _attachments(vec_id, k_hint)
 
+    # Important: NO response_format kwarg here (older SDKs choke on it).
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": sys_inst},
+            {"role": "system", "content": _schema_prompt_block()},
             {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
             {"role": "user", "content": query},
         ],
-        response_format={"type": "json_schema", "json_schema": _json_schema()},
         tools=tools,
         attachments=attachments,
         metadata={"app": "RegulAIte", "user": user_id},
     )
 
+    # Try to extract text from various SDK shapes
     text = getattr(resp, "output_text", None)
     if not text:
         try:
@@ -129,12 +142,16 @@ def ask(
                         parts.append(getattr(c, "text", {}).get("value", ""))
             text = "\n".join(parts)
         except Exception:
-            text = ""
+            # Last resort: try the raw .model_dump_json()
+            try:
+                text = resp.model_dump_json()
+            except Exception:
+                text = ""
 
     data = _parse_json_loose(text or "")
     if not data:
         return DEFAULT_EMPTY
     try:
         return RegulAIteAnswer(**data)
-    except Exception:
+    except ValidationError:
         return DEFAULT_EMPTY
