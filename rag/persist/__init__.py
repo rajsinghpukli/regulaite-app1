@@ -2,7 +2,6 @@ from __future__ import annotations
 import json, os, time
 from typing import List, Dict, Any
 
-# Where chat histories are stored (one JSON per user)
 BASE_DIR = os.path.join(os.path.dirname(__file__), "chats")
 os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -26,7 +25,6 @@ def save_chat(user: str, history: List[Dict[str, Any]]) -> None:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception:
-        # If write fails (e.g., read-only), just ignore
         pass
 
 def append_turn(user: str, role: str, content: str) -> None:
