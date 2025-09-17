@@ -4,6 +4,13 @@ import streamlit as st
 from dotenv import load_dotenv
 from rag.pipeline import ask
 from rag.persist import load_chat, save_chat, append_turn, clear_chat
+from rag.persist.users import (
+    ensure_bootstrap_admin,
+    verify_user,
+    create_user_if_allowed,
+    username_exists,
+    ALLOW_SIGNUP,
+)
 from rag.schema import RegulAIteAnswer
 
 load_dotenv()
@@ -11,35 +18,60 @@ load_dotenv()
 APP_NAME = "RegulaiTE — RAG Assistant"
 DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
-BASIC_USER = os.getenv("BASIC_USER", "raj")
-BASIC_PASS = os.getenv("BASIC_PASS", "pass")
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
+
+# Optional: seed an admin from env on first run
+ensure_bootstrap_admin()
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
-# -------- Auth --------
+# -------- Auth state --------
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
 
-def login_ui():
-    with st.form("login"):
-        st.markdown("### Sign in")
-        u = st.text_input("Username", value=st.session_state.user_id or "")
-        p = st.text_input("Password", type="password")
-        ok = st.form_submit_button("Sign in")
-        if ok:
-            if (u == BASIC_USER) and (p == BASIC_PASS):
-                st.session_state.auth_ok = True
-                st.session_state.user_id = u
-                st.success("Signed in")
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
+def auth_ui():
+    st.markdown("## Sign in")
+
+    tabs = st.tabs(["Sign in", "Create account" if ALLOW_SIGNUP else "Create account (disabled)"])
+
+    with tabs[0]:
+        with st.form("login_form"):
+            u = st.text_input("Username", value=st.session_state.user_id or "")
+            p = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Sign in")
+            if ok:
+                if verify_user(u, p):
+                    st.session_state.auth_ok = True
+                    st.session_state.user_id = u
+                    st.success("Signed in")
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials")
+
+    with tabs[1]:
+        st.caption("Create a new account stored securely on this app (hashed passwords).")
+        disabled = not ALLOW_SIGNUP
+        with st.form("signup_form", clear_on_submit=False):
+            nu = st.text_input("New username", disabled=disabled)
+            npw = st.text_input("New password", type="password", disabled=disabled)
+            npw2 = st.text_input("Confirm password", type="password", disabled=disabled)
+            create = st.form_submit_button("Create account", disabled=disabled)
+            if create and not disabled:
+                if npw != npw2:
+                    st.error("Passwords do not match.")
+                elif username_exists(nu):
+                    st.error("Username already exists.")
+                else:
+                    ok, msg = create_user_if_allowed(nu, npw)
+                    if ok:
+                        st.success(msg + " You can now sign in.")
+                    else:
+                        st.error(msg)
 
 if not st.session_state.auth_ok:
-    login_ui()
+    auth_ui()
     st.stop()
 
 USER = st.session_state.user_id
@@ -66,11 +98,18 @@ with st.sidebar:
     st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
     st.markdown("---")
-    if st.button("Clear conversation"):
-        clear_chat(USER)
-        st.session_state.history = []
-        st.session_state.last_answer = None
-        st.rerun()
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Clear conversation"):
+            clear_chat(USER)
+            st.session_state.history = []
+            st.session_state.last_answer = None
+            st.rerun()
+    with colB:
+        if st.button("Sign out"):
+            st.session_state.auth_ok = False
+            st.session_state.user_id = ""
+            st.rerun()
 
 # -------- Main --------
 st.markdown(f"## {APP_NAME}")
@@ -90,6 +129,7 @@ for turn in st.session_state.history:
     else:
         st.chat_message("assistant").write(turn["content"])
 
+# Follow-up chips
 if isinstance(st.session_state.last_answer, RegulAIteAnswer):
     suggs = st.session_state.last_answer.follow_up_suggestions or []
     if suggs:
@@ -135,9 +175,10 @@ if ask_clicked:
 with st.expander("Notes / Help", expanded=False):
     st.markdown(
         """
-- Set `BASIC_USER` / `BASIC_PASS` in App Service → Configuration.
-- Set `OPENAI_VECTOR_STORE_ID` to your `vs_...` id.
-- Change `RESPONSES_MODEL` if needed (default `gpt-4.1-mini`).
-- Chat memory is saved per user in `rag/persist/chats/<user>.json`.
+- **Create account:** enabled by `ALLOW_SIGNUP=true` (default). Passwords are salted+hashed and saved in `rag/persist/users.json`.
+- **Bootstrap admin:** set `BASIC_USER` and `BASIC_PASS` in App Service → Configuration. On first run, that account is created automatically.
+- **Vector store:** set `OPENAI_VECTOR_STORE_ID` to `vs_...`.
+- **Model:** `RESPONSES_MODEL` (default: `gpt-4.1-mini`).
+- **Memory:** chat history per user at `rag/persist/chats/<user>.json`.
         """
     )
