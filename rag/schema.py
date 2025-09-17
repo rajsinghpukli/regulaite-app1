@@ -7,7 +7,7 @@ RegSource = Literal["IFRS", "AAOIFI", "CBB", "InternalPolicy", "General"]
 class Quote(BaseModel):
     framework: RegSource
     snippet: str
-    citation: Optional[str] = None  # e.g., "IFRS9_Handbook.pdf: p.143" or URL
+    citation: Optional[str] = None
 
 class PerSourceAnswer(BaseModel):
     status: Literal["addressed", "not_found"] = "not_found"
@@ -15,7 +15,6 @@ class PerSourceAnswer(BaseModel):
     quotes: List[Quote] = Field(default_factory=list)
 
 class RegulAIteAnswer(BaseModel):
-    # Canonical 9-section structure you asked to keep
     summary: str
     per_source: Dict[RegSource, PerSourceAnswer]
     comparative_analysis: str = ""
@@ -54,7 +53,6 @@ class RegulAIteAnswer(BaseModel):
             out += ["### Citations", *[f"- {c}" for c in self.citations], ""]
         return "\n".join(out)
 
-# Default blank shell (useful if parsing fails)
 DEFAULT_EMPTY = RegulAIteAnswer(
     summary="",
     per_source={fw: PerSourceAnswer() for fw in ["IFRS", "AAOIFI", "CBB", "InternalPolicy"]},
