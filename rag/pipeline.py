@@ -9,8 +9,30 @@ from .router import normalize_mode
 
 client = OpenAI()
 
+def _per_source_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["addressed", "not_found"]},
+            "notes": {"type": "string"},
+            "quotes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "framework": {"type": "string"},
+                        "snippet": {"type": "string"},
+                        "citation": {"type": "string"},
+                    },
+                    "required": ["framework", "snippet"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    }
+
 def _json_schema() -> Dict[str, Any]:
-    # Minimal schema mirroring RegulAIteAnswer (for structured outputs)
     return {
         "name": "RegulAIteAnswer",
         "schema": {
@@ -41,39 +63,15 @@ def _json_schema() -> Dict[str, Any]:
         "strict": True,
     }
 
-def _per_source_schema() -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["addressed", "not_found"]},
-            "notes": {"type": "string"},
-            "quotes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "framework": {"type": "string"},
-                        "snippet": {"type": "string"},
-                        "citation": {"type": "string"},
-                    },
-                    "required": ["framework", "snippet"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "additionalProperties": False,
-    }
-
 def _attachments(vec_id: Optional[str], k_hint: int) -> Optional[List[Dict[str, Any]]]:
     if not vec_id:
         return None
     return [{
         "vector_store_id": vec_id,
-        "file_search": {"max_num_results": int(k_hint)}  # hint to the Responses API
+        "file_search": {"max_num_results": int(k_hint)}
     }]
 
 def _parse_json_loose(text: str) -> Dict[str, Any]:
-    # Grab the first top-level JSON object from text (robust to prose around it)
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -81,7 +79,6 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
-        # attempt to fix trailing commas, etc.
         raw = re.sub(r",\s*}", "}", raw)
         raw = re.sub(r",\s*]", "]", raw)
         try:
@@ -101,22 +98,15 @@ def ask(
     vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
-    """
-    Orchestrates a single turn to the OpenAI Responses API using vector store and optional web search.
-    Returns a validated RegulAIteAnswer object.
-    """
     model = model or os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
     mode = normalize_mode(mode_hint)
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
     convo_brief = history_to_brief(history)
 
-    tools = []
-    if web_enabled:
-        tools.append({"type": "web_search"})
-
+    tools = [{"type": "web_search"}] if web_enabled else None
     attachments = _attachments(vec_id, k_hint)
 
-    response = client.responses.create(
+    resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": sys_inst},
@@ -124,18 +114,16 @@ def ask(
             {"role": "user", "content": query},
         ],
         response_format={"type": "json_schema", "json_schema": _json_schema()},
-        tools=tools if tools else None,
-        attachments=attachments if attachments else None,
+        tools=tools,
+        attachments=attachments,
         metadata={"app": "RegulAIte", "user": user_id},
     )
 
-    # Try to extract structured JSON
-    text = getattr(response, "output_text", None)
+    text = getattr(resp, "output_text", None)
     if not text:
-        # Some SDK builds use .output with content parts
         try:
             parts = []
-            for block in getattr(response, "output", []):
+            for block in getattr(resp, "output", []):
                 for c in getattr(block, "content", []):
                     if getattr(c, "type", None) == "output_text":
                         parts.append(getattr(c, "text", {}).get("value", ""))
@@ -146,8 +134,7 @@ def ask(
     data = _parse_json_loose(text or "")
     if not data:
         return DEFAULT_EMPTY
-
     try:
         return RegulAIteAnswer(**data)
-    except ValidationError:
+    except Exception:
         return DEFAULT_EMPTY
