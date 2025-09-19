@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict
 
 try:
     from duckduckgo_search import DDGS
@@ -7,10 +7,7 @@ except Exception:
     DDGS = None
 
 def ddg_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """
-    Return a list of dicts: {title, url, snippet}.
-    If DDG is unavailable, return [].
-    """
+    """Return a list of dicts: {title, url, snippet}. Empty list if DDG not available."""
     if DDGS is None:
         return []
     rows = []
