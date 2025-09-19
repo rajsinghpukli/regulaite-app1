@@ -92,9 +92,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("System status")
-    st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
-    st.caption("id:")
-    st.code(VECTOR_STORE_ID or "(none)", language="text")
+
+    if VECTOR_STORE_ID:
+        st.success("Vector store: connected")
+        # Mask the id so it isn't exposed publicly
+        masked = f"{VECTOR_STORE_ID[:6]}…{VECTOR_STORE_ID[-4:]}" if len(VECTOR_STORE_ID) > 10 else "configured"
+        st.caption("id:")
+        st.code(masked, language="text")
+    else:
+        st.info("Vector store: not connected")
+        st.caption("id:")
+        st.code("(none)", language="text")
+
     st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
     st.markdown("---")
@@ -115,31 +124,52 @@ with st.sidebar:
 st.markdown(f"## {APP_NAME}")
 
 query = st.text_input("Ask a question", placeholder="e.g., Connected counterparties completion/closure controls…")
-cols = st.columns([1,1,6])
+cols = st.columns([1, 1, 6])
 with cols[0]:
     ask_clicked = st.button("Ask", type="primary", use_container_width=True)
 with cols[1]:
     paste_example = st.button("Example", use_container_width=True)
 if paste_example:
-    query = "Provide IFRS vs AAOIFI vs CBB guidance on connected counterparty exposures: risk limits, approvals, reporting, and completion/closure controls. Include evidence."
+    query = (
+        "Provide IFRS 9, AAOIFI (FAS 30/33), and CBB Rulebook guidance for "
+        "completion/closure of exposures to connected counterparties: definitions, approval thresholds, "
+        "credit limits/large exposure constraints, reporting/disclosure, and governance controls. "
+        "Return 2–5 short evidence quotes per framework with citations, compare differences, and give "
+        "a concise recommendation for Khaleeji Bank."
+    )
 
+# Render history
 for turn in st.session_state.history:
     if turn["role"] == "user":
         st.chat_message("user").write(turn["content"])
     else:
         st.chat_message("assistant").write(turn["content"])
 
-# Follow-up chips
-if isinstance(st.session_state.last_answer, RegulAIteAnswer):
-    suggs = st.session_state.last_answer.follow_up_suggestions or []
-    if suggs:
-        st.caption("Try a follow-up:")
-        chip_cols = st.columns(3)
-        for i, s in enumerate(suggs[:6]):
-            with chip_cols[i % 3]:
-                if st.button(s, key=f"chip_{i}", use_container_width=True):
-                    query = s
-                    ask_clicked = True
+# Follow-up chips (from last answer if present)
+def render_followups(default_topic: str | None = None):
+    suggs: list[str] = []
+    if isinstance(st.session_state.last_answer, RegulAIteAnswer):
+        suggs = st.session_state.last_answer.follow_up_suggestions or []
+    # Deterministic fallback if model didn't supply any
+    if not suggs:
+        topic = (default_topic or query or "connected counterparties").strip()
+        suggs = [
+            f"What are approval thresholds and board oversight for {topic}?",
+            f"Draft a closure checklist for {topic} with controls and required evidence.",
+            f"What reporting pack fields should be in the monthly board pack for {topic}?",
+            f"How should breaches/exceptions for {topic} be escalated and documented?",
+            f"What stress-test scenarios are relevant for {topic} and how to calibrate them?",
+            f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
+        ]
+    st.caption("Try a follow-up:")
+    chip_cols = st.columns(3)
+    for i, s in enumerate(suggs[:6]):
+        with chip_cols[i % 3]:
+            if st.button(s, key=f"chip_{i}", use_container_width=True):
+                # Clicking a chip fills the input and fires a query
+                st.session_state["__chip_query"] = s
+
+render_followups()
 
 def run_query(q: str):
     if not q.strip():
@@ -160,6 +190,19 @@ def run_query(q: str):
             vec_id=VECTOR_STORE_ID or None,
             model=DEFAULT_MODEL,
         )
+
+    # Ensure we always have some follow-ups
+    if not ans.follow_up_suggestions:
+        topic = (q or "the topic").strip()
+        ans.follow_up_suggestions = [
+            f"What are approval thresholds and board oversight for {topic}?",
+            f"Draft a closure checklist for {topic} with controls and required evidence.",
+            f"What reporting pack fields should be in the monthly board pack for {topic}?",
+            f"How should breaches/exceptions for {topic} be escalated and documented?",
+            f"What stress-test scenarios are relevant for {topic} and how to calibrate them?",
+            f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
+        ]
+
     md = ans.as_markdown().strip() or "_No answer produced._"
 
     append_turn(USER, "assistant", md)
@@ -169,16 +212,21 @@ def run_query(q: str):
 
     st.chat_message("assistant").write(md)
 
-if ask_clicked:
+# Handle button + chip-triggered queries
+if ask_clicked and query:
     run_query(query)
+
+chip_q = st.session_state.pop("__chip_query", None)
+if chip_q:
+    run_query(chip_q)
 
 with st.expander("Notes / Help", expanded=False):
     st.markdown(
         """
 - **Create account:** enabled by `ALLOW_SIGNUP=true` (default). Passwords are salted+hashed and saved in `rag/persist/users.json`.
 - **Bootstrap admin:** set `BASIC_USER` and `BASIC_PASS` in App Service → Configuration. On first run, that account is created automatically.
-- **Vector store:** set `OPENAI_VECTOR_STORE_ID` to `vs_...`.
-- **Model:** `RESPONSES_MODEL` (default: `gpt-4.1-mini`).
+- **Vector store:** set `OPENAI_VECTOR_STORE_ID` to `vs_...`. The id is masked in this UI.
+- **Models:** primary `RESPONSES_MODEL` (default: `gpt-4.1-mini`); fallback chat `CHAT_MODEL` (default: `gpt-4o-mini`).
 - **Memory:** chat history per user at `rag/persist/chats/<user>.json`.
         """
     )
