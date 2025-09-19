@@ -10,24 +10,18 @@ You ALWAYS produce a structured JSON object that will be rendered to Markdown by
 Fields: summary, per_source (IFRS, AAOIFI, CBB, InternalPolicy), comparative_analysis, recommendation,
 general_knowledge, gaps_or_next_steps, citations, ai_opinion, follow_up_suggestions.
 
-Evidence mode policy:
-- If evidence mode is ON, aim for 2–5 short, verbatim quotes per *addressed* framework with a citation.
-- If you can't provide at least 2 real quotes for a framework, set that framework's status to "not_found" and add a short note why.
-- Quotes must be brief (1–3 sentences).
-
 Style rules:
-- Be precise, bank-grade, and decision-oriented.
+- Be precise, decision-oriented, and implementation-focused for a CRO.
 - Use bullets where helpful, but also include concise paragraphs.
-- No fluff. Avoid generic explanations that do not help a CRO make a decision.
-- Follow-up suggestions: 4–6 concrete, clickable next questions relevant to a CRO.
+- Avoid generic filler. Supply concrete controls, thresholds, report fields, and steps.
+- Follow-up suggestions: 6 concrete, clickable next questions relevant to a CRO.
 """
 
 def _mode_addendum(mode: str) -> str:
     if mode == "short":
         return (
             "Mode: SHORT.\n"
-            "- Output should be tight and punchy.\n"
-            "- 5–8 bullets max in Summary; keep sections brief.\n"
+            "- Output tight and punchy. 5–8 bullets in Summary.\n"
             "- No comparison table.\n"
             "- Target ~250–400 words total.\n"
         )
@@ -35,31 +29,45 @@ def _mode_addendum(mode: str) -> str:
         return (
             "Mode: LONG.\n"
             "- Provide rich, practical guidance with specifics for the bank.\n"
-            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB; at least 6–10 rows.\n"
-            "- Provide concise implementation checklist and pitfalls.\n"
-            "- Target ~800–1200 words.\n"
+            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 8 rows).\n"
+            "- Include an implementation checklist and common pitfalls.\n"
+            "- Target ~900–1300 words.\n"
         )
     if mode == "research":
         return (
             "Mode: RESEARCH.\n"
-            "- Provide an Executive summary, then deep sections: Detailed Guidance per framework, Key differences,\n"
-            "  Governance/Controls, Reporting pack list, Implementation checklist, Open issues.\n"
-            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB; at least 10–14 rows.\n"
+            "- Sections: Executive summary; Detailed guidance per framework; Key differences; "
+            "Governance/controls; Reporting pack fields; Implementation checklist; Open issues.\n"
+            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 12 rows).\n"
             "- Add risks, controls, evidence expectations, and regulator lenses.\n"
-            "- Target ~1200–1800 words.\n"
+            "- Target ~1400–2000 words.\n"
         )
     return (
         "Mode: AUTO.\n"
-        "- Choose an appropriate depth.\n"
-        "- Prefer including a comparison table if the topic spans multiple frameworks.\n"
+        "- Choose depth automatically. Include a comparison table if the topic spans multiple frameworks.\n"
     )
 
-def build_system_instruction(k_hint: int, evidence_mode: bool, mode: str,
-                             org_tone: str = "professional, direct, bank-grade clarity") -> str:
-    ev = "Evidence mode is ON (2–5 quotes per addressed framework)" if evidence_mode else \
-         "Evidence mode is OFF; cite when you rely on an external source."
-    mode_rules = _mode_addendum(mode)
+def build_system_instruction(
+    k_hint: int,
+    evidence_mode: bool,
+    mode: str,
+    *,
+    soft_evidence: bool = False,
+    org_tone: str = "professional, direct, bank-grade clarity",
+) -> str:
+    if soft_evidence:
+        ev = (
+            "Soft evidence mode: produce detailed guidance even if you cannot provide 2–5 verbatim quotes. "
+            "Do NOT mark frameworks as 'not_found' solely due to missing quotes; address them with best available "
+            "knowledge and include citations only when reliable sources are present (e.g., retrieved documents or web snippets)."
+        )
+    else:
+        ev = (
+            "Evidence mode is ON (2–5 short, verbatim quotes per addressed framework). "
+            "If you cannot provide at least 2 quotes for a framework, set that framework to 'not_found' and add a short note."
+        )
     size = length_directive(mode)
+    mode_rules = _mode_addendum(mode)
     return f"""{BASE_RULES}
 
 House rules:
@@ -67,28 +75,7 @@ House rules:
 - Top-K hint (if using search): {k_hint}.
 - {ev}
 - {size}
-- If internal policy is unknown, mark as not_found and suggest what evidence to obtain.
+- {mode_rules}
+- If internal policy content is unknown, mark InternalPolicy as not_found and suggest what evidence to obtain.
 
-When building the JSON, fill every field appropriately and ensure the object is valid JSON.
-"""
-
-def history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
-    """
-    Compress recent turns into a short brief fed to the model.
-    Keeps up to `max_pairs` Q/A pairs (2*max_pairs turns).
-    """
-    if not history:
-        return ""
-    turns = history[-(max_pairs * 2):]
-    lines: List[str] = []
-    for h in turns:
-        role = h.get("role")
-        content = (h.get("content") or "").strip()
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"User asked: {content}")
-        else:
-            # Keep a short extract of the assistant reply to avoid token bloat
-            lines.append(f"Assistant replied (extract): {content[:700]}")
-    return "\n".join(lines[-(max_pairs * 2):])
+When building the JSON, fill every field and ensure it is valid JSON only (no markdown)."""
