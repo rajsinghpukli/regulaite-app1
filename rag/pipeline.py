@@ -4,18 +4,14 @@ from typing import Dict, Any, List, Optional
 from openai import OpenAI
 from pydantic import ValidationError
 from .schema import RegulAIteAnswer, DEFAULT_EMPTY
-from .agents import build_system_instruction   # ← only this import from agents
+from .agents import build_system_instruction
 from .router import normalize_mode
 from .websearch import ddg_search
 
 client = OpenAI()
 
-# ---------- Local helper to avoid cross-file import issues -------------------
+# ---- History brief kept local to avoid import drift -------------------------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
-    """
-    Compress recent turns into a short brief fed to the model.
-    Keeps up to `max_pairs` Q/A pairs (2*max_pairs turns).
-    """
     if not history:
         return ""
     turns = history[-(max_pairs * 2):]
@@ -31,7 +27,7 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
             lines.append(f"Assistant replied (extract): {content[:700]}")
     return "\n".join(lines[-(max_pairs * 2):])
 
-# ---------- JSON schema + helpers -------------------------------------------
+# ---- JSON schema helpers ----------------------------------------------------
 def _per_source_schema() -> Dict[str, Any]:
     return {
         "type": "object",
@@ -83,7 +79,6 @@ def _schema_dict() -> Dict[str, Any]:
     }
 
 def _schema_prompt_block() -> str:
-    # Enforce JSON via prompt (keeps compatibility with older SDKs)
     return (
         "You MUST return a SINGLE JSON object that exactly matches this JSON Schema. "
         "Do not include any prose, markdown, or backticks—only the JSON object.\n\n"
@@ -105,23 +100,10 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
         except Exception:
             return {}
 
-def _pick_chat_model(model: str | None) -> str:
-    # Use Chat Completions for max SDK compatibility
-    m = (model or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
-    if "4.1" in m:
-        return "gpt-4o-mini"
-    return m
-
 def _mode_tokens(mode: str) -> int:
-    if mode == "short":
-        return 800
-    if mode == "long":
-        return 1800
-    if mode == "research":
-        return 3000
-    return 1200
+    return {"short": 900, "long": 2600, "research": 3500}.get(mode, 1500)
 
-# ---------- Main entry -------------------------------------------------------
+# ---- Main orchestrator ------------------------------------------------------
 def ask(
     query: str,
     *,
@@ -131,18 +113,18 @@ def ask(
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
     web_enabled: bool = False,
-    vec_id: Optional[str] = None,  # kept for compatibility; not used on older SDKs
+    vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Chat-completions implementation (SDK-safe). Vector store is skipped until your
-    SDK supports Responses attachments. Web search injects real snippets/links.
-    Mode (short/long/research) meaningfully changes length and structure.
+    Preferred path: OpenAI Responses API with vector-store attachments (if supported by SDK).
+    Fallback: Chat Completions with web snippets only (soft evidence).
     """
     mode = normalize_mode(mode_hint)
-    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
     convo_brief = _history_to_brief(history)
+    max_out = _mode_tokens(mode)
 
+    # Build web context (used in both paths; in Responses it helps the model too)
     web_context = ""
     if web_enabled:
         results = ddg_search(query, max_results=min(8, max(4, k_hint)))
@@ -155,6 +137,59 @@ def ask(
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
+    # ---- Try Responses API with attachments (vector store) ------------------
+    responses_model = (model or os.getenv("RESPONSES_MODEL") or "gpt-4.1-mini").strip()
+    try:
+        sys_inst = build_system_instruction(
+            k_hint=k_hint,
+            evidence_mode=evidence_mode,
+            mode=mode,
+            soft_evidence=False if vec_id else True,  # if no VS, soften evidence rules
+        )
+
+        tools = [{"type": "web_search"}] if web_enabled else None
+        attachments = [{"vector_store_id": vec_id, "file_search": {"max_num_results": int(k_hint)}}] if vec_id else None
+
+        resp = client.responses.create(
+            model=responses_model,
+            input=[
+                {"role": "system", "content": sys_inst},
+                {"role": "system", "content": _schema_prompt_block()},
+                {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
+                {"role": "user", "content": web_context} if web_context else None,
+                {"role": "user", "content": query},
+            ],
+            response_format={"type": "json_schema", "json_schema": {"name": "RegulAIteAnswer", "schema": _schema_dict(), "strict": True}},
+            tools=tools,
+            attachments=attachments,
+            max_output_tokens=max_out,
+            metadata={"app": "RegulAIte", "user": user_id},
+        )
+
+        text = getattr(resp, "output_text", None)
+        if not text:
+            parts = []
+            for block in getattr(resp, "output", []):
+                for c in getattr(block, "content", []):
+                    if getattr(c, "type", None) == "output_text":
+                        parts.append(getattr(c, "text", {}).get("value", ""))
+            text = "\n".join(parts)
+
+        data = _parse_json_loose(text or "")
+        if data:
+            return RegulAIteAnswer(**data)
+    except Exception:
+        # If anything goes wrong (older SDK, param mismatch, etc.), fall through to chat path
+        pass
+
+    # ---- Fallback: Chat Completions (no VS) --------------------------------
+    chat_model = (os.getenv("CHAT_MODEL") or "gpt-4o-mini").strip()
+    sys_inst = build_system_instruction(
+        k_hint=k_hint,
+        evidence_mode=evidence_mode,
+        mode=mode,
+        soft_evidence=True,  # soften because we don't have VS here
+    )
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": _schema_prompt_block()},
@@ -164,13 +199,10 @@ def ask(
         messages.append({"role": "user", "content": web_context})
     messages.append({"role": "user", "content": query})
 
-    chat_model = _pick_chat_model(model)
-    max_tokens = _mode_tokens(mode)
-
     resp = client.chat.completions.create(
         model=chat_model,
         temperature=0.2,
-        max_tokens=max_tokens,
+        max_tokens=max_out,
         messages=messages,
     )
 
