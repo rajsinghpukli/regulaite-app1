@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Literal
 from pydantic import BaseModel, Field
 
-RegSource = Literal["IFRS", "AAOIFI", "CBB", "InternalPolicy", "General"]
+RegSource = Literal["IFRS", "AAOIFI", "CBB", "InternalPolicy"]
 
 class Quote(BaseModel):
     framework: RegSource
@@ -10,13 +10,13 @@ class Quote(BaseModel):
     citation: Optional[str] = None
 
 class PerSourceAnswer(BaseModel):
-    status: Literal["addressed", "not_found"] = "not_found"
+    # We no longer expose 'status' to the UI. If a framework has no content, it won't be present.
     notes: Optional[str] = None
     quotes: List[Quote] = Field(default_factory=list)
 
 class RegulAIteAnswer(BaseModel):
     summary: str
-    per_source: Dict[RegSource, PerSourceAnswer]
+    per_source: Dict[RegSource, PerSourceAnswer] = Field(default_factory=dict)
     comparative_analysis: str = ""
     recommendation: str = ""
     general_knowledge: str = ""
@@ -24,36 +24,54 @@ class RegulAIteAnswer(BaseModel):
     citations: List[str] = Field(default_factory=list)
     ai_opinion: str = ""
     follow_up_suggestions: List[str] = Field(default_factory=list)
+    comparison_table_md: Optional[str] = None  # Optional Markdown table
 
     def as_markdown(self) -> str:
-        out = []
-        out += ["### Summary", self.summary.strip(), ""]
-        for fw in ["IFRS", "AAOIFI", "CBB", "InternalPolicy"]:
-            ps = self.per_source.get(fw) or PerSourceAnswer()
-            out += [f"### {fw}", f"Status: **{ps.status}**"]
+        parts: List[str] = []
+
+        if self.summary:
+            parts += ["### Summary", self.summary.strip(), ""]
+
+        # Only render frameworks that actually exist in the object
+        order = ["IFRS", "AAOIFI", "CBB", "InternalPolicy"]
+        for fw in order:
+            ps = self.per_source.get(fw)  # may be None
+            if not ps:
+                continue
+            sec: List[str] = [f"### {fw}"]
             if ps.notes:
-                out += [ps.notes]
+                sec.append(ps.notes.strip())
+
             if ps.quotes:
-                out += ["**Evidence (2–5 quotes):**"]
+                sec.append("")
+                sec.append("**Evidence (2–5 quotes):**")
                 for q in ps.quotes:
-                    tag = f" — _{q.citation}_" if q.citation else ""
-                    out += [f"> {q.snippet}{tag}"]
-            out += [""]
+                    cite = f" — {q.citation}" if q.citation else ""
+                    sec.append(f"> {q.snippet}{cite}")
+            parts += sec + [""]
+
+        if self.comparison_table_md:
+            parts += ["### Comparison", self.comparison_table_md.strip(), ""]
+
         if self.comparative_analysis:
-            out += ["### Comparative analysis", self.comparative_analysis, ""]
+            parts += ["### Comparative analysis", self.comparative_analysis.strip(), ""]
         if self.recommendation:
-            out += ["### Recommendation", self.recommendation, ""]
+            parts += ["### Recommendation", self.recommendation.strip(), ""]
         if self.general_knowledge:
-            out += ["### General knowledge", self.general_knowledge, ""]
+            parts += ["### General knowledge", self.general_knowledge.strip(), ""]
         if self.gaps_or_next_steps:
-            out += ["### Gaps / Next steps", self.gaps_or_next_steps, ""]
+            parts += ["### Gaps / Next steps", self.gaps_or_next_steps.strip(), ""]
         if self.ai_opinion:
-            out += ["### AI opinion", self.ai_opinion, ""]
+            parts += ["### AI opinion", self.ai_opinion.strip(), ""]
         if self.citations:
-            out += ["### Citations", *[f"- {c}" for c in self.citations], ""]
-        return "\n".join(out)
+            parts += ["### Citations"]
+            for c in self.citations:
+                parts.append(f"- {c}")
+            parts.append("")
+
+        return "\n".join(parts).strip()
 
 DEFAULT_EMPTY = RegulAIteAnswer(
-    summary="",
-    per_source={fw: PerSourceAnswer() for fw in ["IFRS", "AAOIFI", "CBB", "InternalPolicy"]},
+    summary="No answer was produced.",
+    per_source={},
 )
