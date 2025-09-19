@@ -1,81 +1,75 @@
 from __future__ import annotations
-from typing import List, Dict
 from .router import length_directive
 
 BASE_RULES = """You are RegulAIte, a regulatory RAG assistant for Khaleeji Bank (Bahrain).
-Your job is to answer like a seasoned CRO advisor. Prioritize IFRS/AAOIFI/CBB and bank-grade clarity.
-When something is uncertain, say so briefly and proceed with reasonable assumptions.
+Answer like a seasoned CRO advisor. Prioritize IFRS/AAOIFI/CBB and bank-grade clarity.
+Use retrieved source material (vector store attachments) as the primary evidence. When web search is on, you may use web snippets as secondary evidence.
 
-You ALWAYS produce a structured JSON object that will be rendered to Markdown by the UI.
-Fields: summary, per_source (IFRS, AAOIFI, CBB, InternalPolicy), comparative_analysis, recommendation,
-general_knowledge, gaps_or_next_steps, citations, ai_opinion, follow_up_suggestions.
+You MUST return a single JSON object (no prose) that the UI renders.
+Required fields:
+- summary (string)
+- per_source (object with optional keys: IFRS, AAOIFI, CBB, InternalPolicy)
+    - Each included key MUST be an object with {notes: string, quotes: [{framework, snippet, citation}]}
+    - Only include a framework if you have something useful to say; otherwise OMIT the key.
+- comparative_analysis (string)
+- recommendation (string)
+- general_knowledge (string)
+- gaps_or_next_steps (string)
+- citations (array of strings)
+- ai_opinion (string)
+- follow_up_suggestions (array of strings; 6 useful, CRO-ready)
+- comparison_table_md (optional string; GitHub-flavored Markdown table)
 
-Style rules:
-- Be precise, decision-oriented, and implementation-focused for a CRO.
-- Use bullets where helpful, but also include concise paragraphs.
-- Avoid generic filler. Supply concrete controls, thresholds, report fields, and steps.
-- Follow-up suggestions: 6 concrete, clickable next questions relevant to a CRO.
+Presentation rules:
+- Be precise, decision-oriented, implementation-focused (controls, thresholds, reporting fields, steps).
+- **Never** write “not found” in the narrative. If you lack evidence for a framework, simply **omit** that framework from per_source.
+- Quotes: concise (1–3 sentences), verbatim, each with a short citation.
 """
 
 def _mode_addendum(mode: str) -> str:
     if mode == "short":
         return (
             "Mode: SHORT.\n"
-            "- Output tight and punchy. 5–8 bullets in Summary.\n"
+            "- Tight and punchy (~250–400 words).\n"
             "- No comparison table.\n"
-            "- Target ~250–400 words total.\n"
+            "- Provide key thresholds, approval ladder, mini checklist.\n"
         )
     if mode == "long":
         return (
             "Mode: LONG.\n"
-            "- Provide rich, practical guidance with specifics for the bank.\n"
-            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 8 rows).\n"
+            "- Rich guidance with specifics for the bank (~900–1300 words).\n"
+            "- Include **comparison_table_md** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 8 rows).\n"
             "- Include an implementation checklist and common pitfalls.\n"
-            "- Target ~900–1300 words.\n"
         )
     if mode == "research":
         return (
             "Mode: RESEARCH.\n"
-            "- Sections: Executive summary; Detailed guidance per framework; Key differences; "
-            "Governance/controls; Reporting pack fields; Implementation checklist; Open issues.\n"
-            "- Include a **comparison table** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 12 rows).\n"
-            "- Add risks, controls, evidence expectations, and regulator lenses.\n"
-            "- Target ~1400–2000 words.\n"
+            "- Deep-dive (~1400–2000 words): Exec summary; Detailed guidance per framework; Key differences; "
+            "Governance/controls; Reporting fields; Implementation checklist; Open issues.\n"
+            "- Include **comparison_table_md** with columns: Topic | IFRS 9 | AAOIFI | CBB (>= 12 rows).\n"
+            "- Add risks, controls, evidence expectations, regulator lenses.\n"
         )
     return (
         "Mode: AUTO.\n"
-        "- Choose depth automatically. Include a comparison table if the topic spans multiple frameworks.\n"
+        "- Choose an appropriate depth. Include a comparison table if the topic spans multiple frameworks.\n"
     )
 
-def build_system_instruction(
-    k_hint: int,
-    evidence_mode: bool,
-    mode: str,
-    *,
-    soft_evidence: bool = False,
-    org_tone: str = "professional, direct, bank-grade clarity",
-) -> str:
-    if soft_evidence:
-        ev = (
-            "Soft evidence mode: produce detailed guidance even if you cannot provide 2–5 verbatim quotes. "
-            "Do NOT mark frameworks as 'not_found' solely due to missing quotes; address them with best available "
-            "knowledge and include citations only when reliable sources are present (e.g., retrieved documents or web snippets)."
-        )
-    else:
-        ev = (
-            "Evidence mode is ON (2–5 short, verbatim quotes per addressed framework). "
-            "If you cannot provide at least 2 quotes for a framework, set that framework to 'not_found' and add a short note."
-        )
+def build_system_instruction(k_hint: int, evidence_mode: bool, mode: str) -> str:
+    ev = (
+        "Evidence mode is ON: Use 2–5 concise verbatim quotes per addressed framework when possible. "
+        "Prefer retrieved (attached) documents; web snippets (if any) are secondary."
+        if evidence_mode else
+        "Evidence mode is OFF: provide detailed guidance; cite when relying on an external source."
+    )
     size = length_directive(mode)
-    mode_rules = _mode_addendum(mode)
+    rules = _mode_addendum(mode)
     return f"""{BASE_RULES}
 
 House rules:
-- Tone: {org_tone}.
-- Top-K hint (if using search): {k_hint}.
+- Top-K retrieval hint: {k_hint}.
 - {ev}
 - {size}
-- {mode_rules}
-- If internal policy content is unknown, mark InternalPolicy as not_found and suggest what evidence to obtain.
+- {rules}
 
-When building the JSON, fill every field and ensure it is valid JSON only (no markdown)."""
+Return **only** a strict JSON object that matches the schema described above—no markdown outside string fields.
+"""
