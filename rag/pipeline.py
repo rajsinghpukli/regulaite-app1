@@ -10,7 +10,6 @@ from .websearch import ddg_search
 
 client = OpenAI()
 
-# ---- History brief kept local to avoid import drift -------------------------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     if not history:
         return ""
@@ -27,44 +26,34 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
             lines.append(f"Assistant replied (extract): {content[:700]}")
     return "\n".join(lines[-(max_pairs * 2):])
 
-# ---- JSON schema helpers ----------------------------------------------------
-def _per_source_schema() -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["addressed", "not_found"]},
-            "notes": {"type": "string"},
-            "quotes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "framework": {"type": "string"},
-                        "snippet": {"type": "string"},
-                        "citation": {"type": "string"},
-                    },
-                    "required": ["framework", "snippet"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "additionalProperties": False,
-    }
-
-def _schema_dict() -> Dict[str, Any]:
+def _json_schema() -> Dict[str, Any]:
+    # Pydantic schema mirror (kept minimal/strict)
     return {
         "type": "object",
         "properties": {
             "summary": {"type": "string"},
             "per_source": {
                 "type": "object",
-                "properties": {
-                    "IFRS": _per_source_schema(),
-                    "AAOIFI": _per_source_schema(),
-                    "CBB": _per_source_schema(),
-                    "InternalPolicy": _per_source_schema(),
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {"type": "string"},
+                        "quotes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "framework": {"type": "string", "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]},
+                                    "snippet": {"type": "string"},
+                                    "citation": {"type": "string"},
+                                },
+                                "required": ["framework", "snippet"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "additionalProperties": False,
                 },
-                "additionalProperties": False,
             },
             "comparative_analysis": {"type": "string"},
             "recommendation": {"type": "string"},
@@ -73,19 +62,20 @@ def _schema_dict() -> Dict[str, Any]:
             "citations": {"type": "array", "items": {"type": "string"}},
             "ai_opinion": {"type": "string"},
             "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
+            "comparison_table_md": {"type": "string"},
         },
         "required": ["summary", "per_source"],
         "additionalProperties": False,
     }
 
-def _schema_prompt_block() -> str:
+def _schema_block() -> str:
     return (
-        "You MUST return a SINGLE JSON object that exactly matches this JSON Schema. "
-        "Do not include any prose, markdown, or backticks—only the JSON object.\n\n"
-        + json.dumps(_schema_dict(), ensure_ascii=False)
+        "Return a SINGLE JSON object that exactly matches this JSON Schema. "
+        "No markdown outside string fields; no extra keys; do not include analysis text before or after the JSON.\n\n"
+        + json.dumps(_json_schema(), ensure_ascii=False)
     )
 
-def _parse_json_loose(text: str) -> Dict[str, Any]:
+def _parse_first_json(text: str) -> Dict[str, Any]:
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -101,9 +91,8 @@ def _parse_json_loose(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    return {"short": 900, "long": 2600, "research": 3500}.get(mode, 1500)
+    return {"short": 1000, "long": 3000, "research": 4200}.get(mode, 1800)
 
-# ---- Main orchestrator ------------------------------------------------------
 def ask(
     query: str,
     *,
@@ -117,19 +106,26 @@ def ask(
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Preferred path: OpenAI Responses API with vector-store attachments (if supported by SDK).
-    Fallback: Chat Completions with web snippets only (soft evidence).
+    Responses API with vector-store attachments ONLY.
+    If attachments are not supported or the vector store id is missing, this will raise.
     """
+    if not vec_id:
+        # Hard requirement per your request: no fallback.
+        return DEFAULT_EMPTY
+
     mode = normalize_mode(mode_hint)
+    responses_model = (model or os.getenv("RESPONSES_MODEL") or "gpt-4.1-mini").strip()
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
-    # Build web context (used in both paths; in Responses it helps the model too)
+    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
+
+    # Web context (secondary to VS)
     web_context = ""
     if web_enabled:
         results = ddg_search(query, max_results=min(8, max(4, k_hint)))
         if results:
-            lines = ["Relevant web snippets (use for evidence if reliable):"]
+            lines = ["Relevant web snippets (secondary to attached docs):"]
             for i, r in enumerate(results, 1):
                 snippet = (r.get("snippet") or "").strip()[:350]
                 title = r.get("title") or ""
@@ -137,82 +133,43 @@ def ask(
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
-    # ---- Try Responses API with attachments (vector store) ------------------
-    responses_model = (model or os.getenv("RESPONSES_MODEL") or "gpt-4.1-mini").strip()
-    try:
-        sys_inst = build_system_instruction(
-            k_hint=k_hint,
-            evidence_mode=evidence_mode,
-            mode=mode,
-            soft_evidence=False if vec_id else True,  # if no VS, soften evidence rules
-        )
+    attachments = [{"vector_store_id": vec_id, "file_search": {"max_num_results": int(k_hint)}}]
 
-        tools = [{"type": "web_search"}] if web_enabled else None
-        attachments = [{"vector_store_id": vec_id, "file_search": {"max_num_results": int(k_hint)}}] if vec_id else None
-
-        resp = client.responses.create(
-            model=responses_model,
-            input=[
-                {"role": "system", "content": sys_inst},
-                {"role": "system", "content": _schema_prompt_block()},
-                {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
-                {"role": "user", "content": web_context} if web_context else None,
-                {"role": "user", "content": query},
-            ],
-            response_format={"type": "json_schema", "json_schema": {"name": "RegulAIteAnswer", "schema": _schema_dict(), "strict": True}},
-            tools=tools,
-            attachments=attachments,
-            max_output_tokens=max_out,
-            metadata={"app": "RegulAIte", "user": user_id},
-        )
-
-        text = getattr(resp, "output_text", None)
-        if not text:
-            parts = []
-            for block in getattr(resp, "output", []):
-                for c in getattr(block, "content", []):
-                    if getattr(c, "type", None) == "output_text":
-                        parts.append(getattr(c, "text", {}).get("value", ""))
-            text = "\n".join(parts)
-
-        data = _parse_json_loose(text or "")
-        if data:
-            return RegulAIteAnswer(**data)
-    except Exception:
-        # If anything goes wrong (older SDK, param mismatch, etc.), fall through to chat path
-        pass
-
-    # ---- Fallback: Chat Completions (no VS) --------------------------------
-    chat_model = (os.getenv("CHAT_MODEL") or "gpt-4o-mini").strip()
-    sys_inst = build_system_instruction(
-        k_hint=k_hint,
-        evidence_mode=evidence_mode,
-        mode=mode,
-        soft_evidence=True,  # soften because we don't have VS here
-    )
-    messages = [
-        {"role": "system", "content": sys_inst},
-        {"role": "system", "content": _schema_prompt_block()},
-        {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
-    ]
-    if web_context:
-        messages.append({"role": "user", "content": web_context})
-    messages.append({"role": "user", "content": query})
-
-    resp = client.chat.completions.create(
-        model=chat_model,
-        temperature=0.2,
-        max_tokens=max_out,
-        messages=messages,
+    resp = client.responses.create(
+        model=responses_model,
+        input=[
+            {"role": "system", "content": sys_inst},
+            {"role": "system", "content": _schema_block()},
+            {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
+            {"role": "user", "content": web_context} if web_context else None,
+            {"role": "user", "content": query},
+        ],
+        # Strict schema forces long, structured answers that our renderer understands
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "RegulAIteAnswer",
+                "schema": _json_schema(),
+                "strict": True,
+            },
+        },
+        tools=[{"type": "web_search"}] if web_enabled else None,
+        attachments=attachments,
+        max_output_tokens=max_out,
+        metadata={"app": "RegulAIte", "user": user_id},
     )
 
-    text = ""
-    try:
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        text = ""
+    # Extract text from Responses API objects
+    text = getattr(resp, "output_text", None)
+    if not text:
+        parts = []
+        for block in getattr(resp, "output", []):
+            for c in getattr(block, "content", []):
+                if getattr(c, "type", None) == "output_text":
+                    parts.append(getattr(c, "text", {}).get("value", ""))
+        text = "\n".join(parts)
 
-    data = _parse_json_loose(text or "")
+    data = _parse_first_json(text or "")
     if not data:
         return DEFAULT_EMPTY
     try:
