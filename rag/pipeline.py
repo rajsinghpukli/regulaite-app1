@@ -10,6 +10,7 @@ from .websearch import ddg_search
 
 client = OpenAI()
 
+# ---------- Helpers ----------------------------------------------------------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     if not history:
         return ""
@@ -27,7 +28,7 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     return "\n".join(lines[-(max_pairs * 2):])
 
 def _json_schema() -> Dict[str, Any]:
-    # Pydantic schema mirror (kept minimal/strict)
+    # Mirrors RegulAIteAnswer (without 'status' anywhere)
     return {
         "type": "object",
         "properties": {
@@ -43,7 +44,10 @@ def _json_schema() -> Dict[str, Any]:
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "framework": {"type": "string", "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]},
+                                    "framework": {
+                                        "type": "string",
+                                        "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]
+                                    },
                                     "snippet": {"type": "string"},
                                     "citation": {"type": "string"},
                                 },
@@ -69,9 +73,10 @@ def _json_schema() -> Dict[str, Any]:
     }
 
 def _schema_block() -> str:
+    # Enforce JSON via prompt (no response_format kwarg).
     return (
         "Return a SINGLE JSON object that exactly matches this JSON Schema. "
-        "No markdown outside string fields; no extra keys; do not include analysis text before or after the JSON.\n\n"
+        "No markdown outside string fields; no extra keys; do not include analysis before/after the JSON.\n\n"
         + json.dumps(_json_schema(), ensure_ascii=False)
     )
 
@@ -93,6 +98,7 @@ def _parse_first_json(text: str) -> Dict[str, Any]:
 def _mode_tokens(mode: str) -> int:
     return {"short": 1000, "long": 3000, "research": 4200}.get(mode, 1800)
 
+# ---------- Main -------------------------------------------------------------
 def ask(
     query: str,
     *,
@@ -106,11 +112,12 @@ def ask(
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Responses API with vector-store attachments ONLY.
-    If attachments are not supported or the vector store id is missing, this will raise.
+    Strictly use Responses API with **vector-store attachments**.
+    We DO NOT pass 'response_format' or 'tools' to keep compatibility with your SDK.
+    JSON is enforced via the prompt and parsed here.
     """
     if not vec_id:
-        # Hard requirement per your request: no fallback.
+        # Per your request: no fallback. If there is no VS id, produce empty.
         return DEFAULT_EMPTY
 
     mode = normalize_mode(mode_hint)
@@ -120,7 +127,7 @@ def ask(
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # Web context (secondary to VS)
+    # Optional web context (secondary to VS)
     web_context = ""
     if web_enabled:
         results = ddg_search(query, max_results=min(8, max(4, k_hint)))
@@ -135,6 +142,7 @@ def ask(
 
     attachments = [{"vector_store_id": vec_id, "file_search": {"max_num_results": int(k_hint)}}]
 
+    # IMPORTANT: no response_format= and no tools=  → compatible with your current SDK.
     resp = client.responses.create(
         model=responses_model,
         input=[
@@ -144,30 +152,23 @@ def ask(
             {"role": "user", "content": web_context} if web_context else None,
             {"role": "user", "content": query},
         ],
-        # Strict schema forces long, structured answers that our renderer understands
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "RegulAIteAnswer",
-                "schema": _json_schema(),
-                "strict": True,
-            },
-        },
-        tools=[{"type": "web_search"}] if web_enabled else None,
         attachments=attachments,
         max_output_tokens=max_out,
         metadata={"app": "RegulAIte", "user": user_id},
     )
 
-    # Extract text from Responses API objects
+    # Extract the model's text and parse JSON
     text = getattr(resp, "output_text", None)
     if not text:
-        parts = []
-        for block in getattr(resp, "output", []):
-            for c in getattr(block, "content", []):
-                if getattr(c, "type", None) == "output_text":
-                    parts.append(getattr(c, "text", {}).get("value", ""))
-        text = "\n".join(parts)
+        try:
+            parts = []
+            for block in getattr(resp, "output", []):
+                for c in getattr(block, "content", []):
+                    if getattr(c, "type", None) == "output_text":
+                        parts.append(getattr(c, "text", {}).get("value", ""))
+            text = "\n".join(parts)
+        except Exception:
+            text = ""
 
     data = _parse_first_json(text or "")
     if not data:
