@@ -109,22 +109,27 @@ def ask(
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Chat Completions path (no attachments). This avoids the SDK crash and
-    produces long, ChatGPT-style answers with tables in long/research modes.
-    When your environment upgrades to a Responses version that supports
-    attachments, we can switch to the vector-store path again.
+    Chat Completions path (no attachments). This avoids SDK keyword errors and
+    produces long, ChatGPT-style answers with a comparison table in long/research.
+    Frameworks with no evidence should be omitted (not marked 'not_found').
     """
     mode = normalize_mode(mode_hint)
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
-    # Build a system instruction that asks for long, non-rigid output
+    # Build the main system instruction from agents.py (no soft_evidence kwarg).
     sys_inst = build_system_instruction(
         k_hint=k_hint,
         evidence_mode=evidence_mode,
         mode=mode,
-        # soft_evidence True so it doesn't spam "not found"
-        soft_evidence=True,
+    )
+
+    # Inline patch: emphasize NO "not_found" spam and “ChatGPT-style” depth.
+    soft_evidence_patch = (
+        "Important: Do NOT say 'not found'. If you lack evidence for a framework, "
+        "omit that framework key from per_source. Provide long, flowing, natural guidance "
+        "like a senior CRO would. In long/research modes, include a substantial comparison "
+        "table (comparison_table_md) and an implementation checklist."
     )
 
     # Optional web context (gives snippets + links to anchor facts)
@@ -143,6 +148,7 @@ def ask(
     # Build messages
     messages = [
         {"role": "system", "content": sys_inst},
+        {"role": "system", "content": soft_evidence_patch},
         {"role": "system", "content": _schema_block()},
         {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
     ]
