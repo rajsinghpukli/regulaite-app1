@@ -10,7 +10,7 @@ from .websearch import ddg_search
 
 client = OpenAI()
 
-# ----------------- Helpers -----------------
+# ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     if not history:
         return ""
@@ -27,11 +27,12 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
             lines.append(f"Assistant replied (extract): {content[:700]}")
     return "\n".join(lines[-(max_pairs * 2):])
 
-def _json_schema() -> Dict[str, Any]:
-    # Mirrors RegulAIteAnswer (no "status"; frameworks omitted if empty)
+def _schema_dict() -> Dict[str, Any]:
+    # minimal, narrative-first schema
     return {
         "type": "object",
         "properties": {
+            "raw_markdown": {"type": "string"},
             "summary": {"type": "string"},
             "per_source": {
                 "type": "object",
@@ -56,27 +57,21 @@ def _json_schema() -> Dict[str, Any]:
                     "additionalProperties": False,
                 },
             },
-            "comparative_analysis": {"type": "string"},
-            "recommendation": {"type": "string"},
-            "general_knowledge": {"type": "string"},
-            "gaps_or_next_steps": {"type": "string"},
-            "citations": {"type": "array", "items": {"type": "string"}},
-            "ai_opinion": {"type": "string"},
-            "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
             "comparison_table_md": {"type": "string"},
+            "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["summary", "per_source"],
-        "additionalProperties": False,
+        "required": ["raw_markdown", "summary", "per_source", "follow_up_suggestions"],
+        "additionalProperties": True,
     }
 
-def _schema_block() -> str:
+def _schema_prompt() -> str:
     return (
-        "Return a SINGLE JSON object that exactly matches this JSON Schema. "
-        "No markdown outside string fields; do not include any analysis before/after the JSON.\n\n"
-        + json.dumps(_json_schema(), ensure_ascii=False)
+        "Return ONE JSON object that exactly matches this JSON Schema. "
+        "No analysis before/after the JSON; no markdown outside string fields.\n\n"
+        + json.dumps(_schema_dict(), ensure_ascii=False)
     )
 
-def _parse_first_json(text: str) -> Dict[str, Any]:
+def _parse_json(text: str) -> Dict[str, Any]:
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -92,10 +87,9 @@ def _parse_first_json(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    # Generous budgets for long/research so it feels like ChatGPT
     return {"short": 900, "long": 2600, "research": 3800}.get(mode, 1600)
 
-# ----------------- Main -----------------
+# ---------- main ----------
 def ask(
     query: str,
     *,
@@ -105,39 +99,20 @@ def ask(
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
     web_enabled: bool = False,
-    vec_id: Optional[str] = None,   # Ignored on this SDK path (attachments not supported)
+    vec_id: Optional[str] = None,   # unused in this SDK path
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
-    """
-    Chat Completions path (no attachments). This avoids SDK keyword errors and
-    produces long, ChatGPT-style answers with a comparison table in long/research.
-    Frameworks with no evidence should be omitted (not marked 'not_found').
-    """
     mode = normalize_mode(mode_hint)
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
-    # Build the main system instruction from agents.py (no soft_evidence kwarg).
-    sys_inst = build_system_instruction(
-        k_hint=k_hint,
-        evidence_mode=evidence_mode,
-        mode=mode,
-    )
+    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # Inline patch: emphasize NO "not_found" spam and “ChatGPT-style” depth.
-    soft_evidence_patch = (
-        "Important: Do NOT say 'not found'. If you lack evidence for a framework, "
-        "omit that framework key from per_source. Provide long, flowing, natural guidance "
-        "like a senior CRO would. In long/research modes, include a substantial comparison "
-        "table (comparison_table_md) and an implementation checklist."
-    )
-
-    # Optional web context (gives snippets + links to anchor facts)
     web_context = ""
     if web_enabled:
         results = ddg_search(query, max_results=min(10, max(6, k_hint)))
         if results:
-            lines = ["Relevant web snippets (use prudently for evidence):"]
+            lines = ["Web snippets (use prudently; VS/internal docs take precedence if available):"]
             for i, r in enumerate(results, 1):
                 snippet = (r.get("snippet") or "").strip()[:400]
                 title = r.get("title") or ""
@@ -145,11 +120,9 @@ def ask(
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
-    # Build messages
     messages = [
         {"role": "system", "content": sys_inst},
-        {"role": "system", "content": soft_evidence_patch},
-        {"role": "system", "content": _schema_block()},
+        {"role": "system", "content": _schema_prompt()},
         {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
     ]
     if web_context:
@@ -171,7 +144,7 @@ def ask(
     except Exception:
         text = ""
 
-    data = _parse_first_json(text or "")
+    data = _parse_json(text or "")
     if not data:
         return DEFAULT_EMPTY
     try:
