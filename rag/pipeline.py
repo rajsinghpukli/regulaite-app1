@@ -10,7 +10,7 @@ from .websearch import ddg_search
 
 client = OpenAI()
 
-# ---------- Helpers ----------------------------------------------------------
+# ----------------- Helpers -----------------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     if not history:
         return ""
@@ -28,7 +28,7 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     return "\n".join(lines[-(max_pairs * 2):])
 
 def _json_schema() -> Dict[str, Any]:
-    # Mirrors RegulAIteAnswer (without 'status' anywhere)
+    # Mirrors RegulAIteAnswer (no "status"; frameworks omitted if empty)
     return {
         "type": "object",
         "properties": {
@@ -44,10 +44,7 @@ def _json_schema() -> Dict[str, Any]:
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "framework": {
-                                        "type": "string",
-                                        "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]
-                                    },
+                                    "framework": {"type": "string", "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]},
                                     "snippet": {"type": "string"},
                                     "citation": {"type": "string"},
                                 },
@@ -73,10 +70,9 @@ def _json_schema() -> Dict[str, Any]:
     }
 
 def _schema_block() -> str:
-    # Enforce JSON via prompt (no response_format kwarg).
     return (
         "Return a SINGLE JSON object that exactly matches this JSON Schema. "
-        "No markdown outside string fields; no extra keys; do not include analysis before/after the JSON.\n\n"
+        "No markdown outside string fields; do not include any analysis before/after the JSON.\n\n"
         + json.dumps(_json_schema(), ensure_ascii=False)
     )
 
@@ -96,9 +92,10 @@ def _parse_first_json(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    return {"short": 1000, "long": 3000, "research": 4200}.get(mode, 1800)
+    # Generous budgets for long/research so it feels like ChatGPT
+    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 1600)
 
-# ---------- Main -------------------------------------------------------------
+# ----------------- Main -----------------
 def ask(
     query: str,
     *,
@@ -108,67 +105,65 @@ def ask(
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
     web_enabled: bool = False,
-    vec_id: Optional[str] = None,
+    vec_id: Optional[str] = None,   # Ignored on this SDK path (attachments not supported)
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
-    Strictly use Responses API with **vector-store attachments**.
-    We DO NOT pass 'response_format' or 'tools' to keep compatibility with your SDK.
-    JSON is enforced via the prompt and parsed here.
+    Chat Completions path (no attachments). This avoids the SDK crash and
+    produces long, ChatGPT-style answers with tables in long/research modes.
+    When your environment upgrades to a Responses version that supports
+    attachments, we can switch to the vector-store path again.
     """
-    if not vec_id:
-        # Per your request: no fallback. If there is no VS id, produce empty.
-        return DEFAULT_EMPTY
-
     mode = normalize_mode(mode_hint)
-    responses_model = (model or os.getenv("RESPONSES_MODEL") or "gpt-4.1-mini").strip()
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
-    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
+    # Build a system instruction that asks for long, non-rigid output
+    sys_inst = build_system_instruction(
+        k_hint=k_hint,
+        evidence_mode=evidence_mode,
+        mode=mode,
+        # soft_evidence True so it doesn't spam "not found"
+        soft_evidence=True,
+    )
 
-    # Optional web context (secondary to VS)
+    # Optional web context (gives snippets + links to anchor facts)
     web_context = ""
     if web_enabled:
-        results = ddg_search(query, max_results=min(8, max(4, k_hint)))
+        results = ddg_search(query, max_results=min(10, max(6, k_hint)))
         if results:
-            lines = ["Relevant web snippets (secondary to attached docs):"]
+            lines = ["Relevant web snippets (use prudently for evidence):"]
             for i, r in enumerate(results, 1):
-                snippet = (r.get("snippet") or "").strip()[:350]
+                snippet = (r.get("snippet") or "").strip()[:400]
                 title = r.get("title") or ""
                 url = r.get("url") or ""
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
-    attachments = [{"vector_store_id": vec_id, "file_search": {"max_num_results": int(k_hint)}}]
+    # Build messages
+    messages = [
+        {"role": "system", "content": sys_inst},
+        {"role": "system", "content": _schema_block()},
+        {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
+    ]
+    if web_context:
+        messages.append({"role": "user", "content": web_context})
+    messages.append({"role": "user", "content": query})
 
-    # IMPORTANT: no response_format= and no tools=  → compatible with your current SDK.
-    resp = client.responses.create(
-        model=responses_model,
-        input=[
-            {"role": "system", "content": sys_inst},
-            {"role": "system", "content": _schema_block()},
-            {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
-            {"role": "user", "content": web_context} if web_context else None,
-            {"role": "user", "content": query},
-        ],
-        attachments=attachments,
-        max_output_tokens=max_out,
-        metadata={"app": "RegulAIte", "user": user_id},
+    chat_model = (os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
+
+    resp = client.chat.completions.create(
+        model=chat_model,
+        temperature=0.2,
+        max_tokens=max_out,
+        messages=messages,
     )
 
-    # Extract the model's text and parse JSON
-    text = getattr(resp, "output_text", None)
-    if not text:
-        try:
-            parts = []
-            for block in getattr(resp, "output", []):
-                for c in getattr(block, "content", []):
-                    if getattr(c, "type", None) == "output_text":
-                        parts.append(getattr(c, "text", {}).get("value", ""))
-            text = "\n".join(parts)
-        except Exception:
-            text = ""
+    text = ""
+    try:
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        text = ""
 
     data = _parse_first_json(text or "")
     if not data:
