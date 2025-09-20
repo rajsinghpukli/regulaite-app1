@@ -1,12 +1,13 @@
 from __future__ import annotations
 import os, json, re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from openai import OpenAI
 from pydantic import ValidationError
 from .schema import RegulAIteAnswer, DEFAULT_EMPTY
 from .agents import build_system_instruction
 from .router import normalize_mode
 from .websearch import ddg_search
+from .prompts import STYLE_GUIDE, FEW_SHOT_EXAMPLE
 
 client = OpenAI()
 
@@ -89,6 +90,23 @@ def _parse_json(text: str) -> Dict[str, Any]:
 def _mode_tokens(mode: str) -> int:
     return {"short": 900, "long": 2600, "research": 3800}.get(mode, 1600)
 
+def _auto_enable_web(query: str, mode: str) -> bool:
+    """
+    Lightweight heuristic to mimic 'ChatGPT uses web when needed':
+    - enable for research mode
+    - enable when the query explicitly asks for 'latest', 'recent', 'up to date', or URLs
+    - otherwise off by default (vector store preferred)
+    """
+    q = (query or "").lower()
+    if mode == "research":
+        return True
+    trigger_words = ("latest", "recent", "up to date", "today", "news", "update")
+    if any(t in q for t in trigger_words):
+        return True
+    if "http://" in q or "https://" in q:
+        return True
+    return False
+
 # ---------- main ----------
 def ask(
     query: str,
@@ -98,21 +116,28 @@ def ask(
     k_hint: int = 5,
     evidence_mode: bool = True,
     mode_hint: str | None = "auto",
-    web_enabled: bool = False,
-    vec_id: Optional[str] = None,   # unused in this SDK path
+    web_enabled: Union[bool, str] = False,   # accept True/False or "auto"
+    vec_id: Optional[str] = None,            # (kept for compatibility; retrieval handled elsewhere)
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
+    """
+    Produces a ChatGPT-like answer carried inside `raw_markdown`.
+    - Vector store remains the primary evidence (handled elsewhere in your app).
+    - Optional web search adds 'context snippets' like ChatGPT when 'web_enabled' is True or 'auto'.
+    """
     mode = normalize_mode(mode_hint)
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
+    # --- Optional web context (soft, never overrides VS) ---
+    use_web = (web_enabled is True) or (isinstance(web_enabled, str) and web_enabled.lower() == "auto" and _auto_enable_web(query, mode))
     web_context = ""
-    if web_enabled:
+    if use_web:
         results = ddg_search(query, max_results=min(10, max(6, k_hint)))
         if results:
-            lines = ["Web snippets (use prudently; VS/internal docs take precedence if available):"]
+            lines = ["Web snippets (use prudently; Vector Store/internal docs take precedence):"]
             for i, r in enumerate(results, 1):
                 snippet = (r.get("snippet") or "").strip()[:400]
                 title = r.get("title") or ""
@@ -120,8 +145,11 @@ def ask(
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
+    # --- Chat messages ---
     messages = [
         {"role": "system", "content": sys_inst},
+        {"role": "system", "content": STYLE_GUIDE},
+        {"role": "system", "content": FEW_SHOT_EXAMPLE},
         {"role": "system", "content": _schema_prompt()},
         {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
     ]
@@ -129,11 +157,12 @@ def ask(
         messages.append({"role": "user", "content": web_context})
     messages.append({"role": "user", "content": query})
 
-    chat_model = (os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
+    chat_model = (model or os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
 
     resp = client.chat.completions.create(
         model=chat_model,
-        temperature=0.2,
+        temperature=0.35,   # natural but controlled
+        top_p=0.95,
         max_tokens=max_out,
         messages=messages,
     )
