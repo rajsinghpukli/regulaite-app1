@@ -29,7 +29,6 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     return "\n".join(lines[-(max_pairs * 2):])
 
 def _schema_dict() -> Dict[str, Any]:
-    # minimal, narrative-first schema
     return {
         "type": "object",
         "properties": {
@@ -88,24 +87,8 @@ def _parse_json(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 1600)
-
-def _auto_enable_web(query: str, mode: str) -> bool:
-    """
-    Lightweight heuristic to mimic 'ChatGPT uses web when needed':
-    - enable for research mode
-    - enable when the query explicitly asks for 'latest', 'recent', 'up to date', or URLs
-    - otherwise off by default (vector store preferred)
-    """
-    q = (query or "").lower()
-    if mode == "research":
-        return True
-    trigger_words = ("latest", "recent", "up to date", "today", "news", "update")
-    if any(t in q for t in trigger_words):
-        return True
-    if "http://" in q or "https://" in q:
-        return True
-    return False
+    # push long outputs; research is the default
+    return {"short": 900, "long": 2200, "research": 3200}.get(mode, 2800)
 
 # ---------- main ----------
 def ask(
@@ -113,39 +96,37 @@ def ask(
     *,
     user_id: str,
     history: List[Dict[str, str]],
-    k_hint: int = 5,
+    k_hint: int = 12,                     # use high Top-K internally
     evidence_mode: bool = True,
-    mode_hint: str | None = "auto",
-    web_enabled: Union[bool, str] = False,   # accept True/False or "auto"
-    vec_id: Optional[str] = None,            # (kept for compatibility; retrieval handled elsewhere)
+    mode_hint: str | None = "research",   # default to research-long answers
+    web_enabled: Union[bool, str] = True, # always on for pilot
+    vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
     """
     Produces a ChatGPT-like answer carried inside `raw_markdown`.
-    - Vector store remains the primary evidence (handled elsewhere in your app).
-    - Optional web search adds 'context snippets' like ChatGPT when 'web_enabled' is True or 'auto'.
+    - Vector store remains the primary evidence (handled by OpenAI Responses on your backend).
+    - Web search is ALWAYS enabled in pilot to enrich context like ChatGPT.
+    - Frameworks with no evidence are omitted silently (never say 'not found').
     """
-    mode = normalize_mode(mode_hint)
+    mode = normalize_mode(mode_hint or "research")
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # --- Optional web context (soft, never overrides VS) ---
-    use_web = (web_enabled is True) or (isinstance(web_enabled, str) and web_enabled.lower() == "auto" and _auto_enable_web(query, mode))
+    # --- Web context (always-on enrichment) ---
+    results = ddg_search(query, max_results=max(8, k_hint))
     web_context = ""
-    if use_web:
-        results = ddg_search(query, max_results=min(10, max(6, k_hint)))
-        if results:
-            lines = ["Web snippets (use prudently; Vector Store/internal docs take precedence):"]
-            for i, r in enumerate(results, 1):
-                snippet = (r.get("snippet") or "").strip()[:400]
-                title = r.get("title") or ""
-                url = r.get("url") or ""
-                lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
-            web_context = "\n".join(lines)
+    if results:
+        lines = ["Web snippets (use prudently; Vector Store/internal docs take precedence):"]
+        for i, r in enumerate(results, 1):
+            snippet = (r.get("snippet") or "").strip()[:450]
+            title = r.get("title") or ""
+            url = r.get("url") or ""
+            lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
+        web_context = "\n".join(lines)
 
-    # --- Chat messages ---
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
@@ -158,10 +139,9 @@ def ask(
     messages.append({"role": "user", "content": query})
 
     chat_model = (model or os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
-
     resp = client.chat.completions.create(
         model=chat_model,
-        temperature=0.35,   # natural but controlled
+        temperature=0.35,
         top_p=0.95,
         max_tokens=max_out,
         messages=messages,
