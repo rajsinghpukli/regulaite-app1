@@ -1,6 +1,5 @@
-# app.py
 from __future__ import annotations
-import os, re, json
+import os, re
 from typing import Any, Dict, List
 import streamlit as st
 from dotenv import load_dotenv
@@ -30,7 +29,7 @@ CSS = """
 .regu-msg{border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px #0001;border:1px solid #0001;margin-bottom:10px}
 .regu-user{background:#f5f7fb}
 .regu-assistant{background:#fff}
-.markdown-body { width: 100%; word-break: normal; overflow-wrap: break-word; hyphens: auto; }
+.markdown-body { width:100%; word-break: normal; overflow-wrap: break-word; hyphens: auto; }
 .markdown-body h1,.markdown-body h2,.markdown-body h3{margin-top:1.2rem}
 .markdown-body p,.markdown-body li{line-height:1.6}
 .markdown-body table{width:100%;border-collapse:collapse}
@@ -55,7 +54,6 @@ def _strip_code_fences(s: str) -> str:
     return s.strip()
 
 def _unescape(text: str) -> str:
-    # Turn visible "\n" into real newlines only if needed
     return text.replace("\\n", "\n") if "\\n" in text and "\n" not in text else text
 
 def _coerce_answer_to_markdown(ans: RegulAIteAnswer) -> str:
@@ -111,7 +109,8 @@ with st.sidebar:
 # ---- main ----
 st.markdown(f"## {APP_NAME}")
 
-query = st.text_input(
+# Top query (nice for the first question)
+top_query = st.text_input(
     "Ask a question",
     placeholder="e.g., According to the CBB Rulebook, what are disclosure requirements for large exposures (compare with Basel)?",
 )
@@ -124,53 +123,59 @@ def run_query(q: str):
     save_chat(USER, st.session_state.history)
 
     with st.spinner("Thinking…"):
-        ans: RegulAIteAnswer = ask(
-            query=q, user_id=USER, history=st.session_state.history,
-            k_hint=12, evidence_mode=True, mode_hint="long",
-            web_enabled=True, vec_id=VECTOR_STORE_ID or None, model=DEFAULT_MODEL,
-        )
+        try:
+            ans: RegulAIteAnswer = ask(
+                query=q, user_id=USER, history=st.session_state.history,
+                k_hint=12, evidence_mode=True, mode_hint="long",
+                web_enabled=True, vec_id=VECTOR_STORE_ID or None, model=DEFAULT_MODEL,
+            )
+        except Exception as e:
+            # Never crash UI
+            ans = RegulAIteAnswer(raw_markdown=f"### Error\nCould not complete the request.\n\nDetails: {e}")
 
     md = _coerce_answer_to_markdown(ans)
     append_turn(USER, "assistant", md)
     st.session_state.history.append({"role": "assistant", "content": md})
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
-    # NOTE: do NOT render here; the history loop below will render once.
 
-# Ask button
-cols = st.columns([1, 6])
-with cols[0]:
-    if st.button("Ask", type="primary", use_container_width=True) and query:
-        run_query(query)
+# Button for the top box
+cbtn, _ = st.columns([1,6])
+with cbtn:
+    if st.button("Ask", type="primary", use_container_width=True) and top_query:
+        run_query(top_query)
 
-# single-source rendering (no duplicates)
+# Render history (single source of truth)
 for turn in st.session_state.history:
     render_message(turn["role"], _unescape(_strip_code_fences(turn["content"])))
 
-# Follow-up chips
+# Bottom sticky chat composer (for continuing the chat)
+user_chat = st.chat_input("Type a follow-up…")
+if user_chat:
+    run_query(user_chat)
+
+# Follow-up chips (short labels)
 def render_followups():
     suggs: List[str] = []
     if isinstance(st.session_state.last_answer, RegulAIteAnswer):
         suggs = (st.session_state.last_answer.follow_up_suggestions or [])
     if not suggs:
-        topic = (query or "this topic").strip()
+        topic = "this topic"
         suggs = [
-            f"What are approval thresholds and board oversight for {topic}?",
-            f"Draft a closure checklist for {topic} with controls and required evidence.",
-            f"What reporting pack fields should be in the monthly board pack for {topic}?",
-            f"How should breaches/exceptions for {topic} be escalated and documented?",
-            f"What stress-test scenarios are relevant for {topic} and how to calibrate them?",
-            f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
+            f"Board approval thresholds for large exposures",
+            f"Monthly reporting checklist for large exposures",
+            f"Escalation steps for breaches and exceptions",
+            f"Stress-test scenarios for concentration risk",
+            f"KRIs and metrics for exposure concentration",
+            f"Differences CBB vs Basel: connected parties",
         ]
+    # truncate labels so they look neat
+    suggs = [s[:90] + ("…" if len(s) > 90 else "") for s in suggs]
     st.caption("Try a follow-up:")
     cols = st.columns(3)
     for i, s in enumerate(suggs[:6]):
         with cols[i % 3]:
             if st.button(s, key=f"chip_{len(st.session_state.history)}_{i}", use_container_width=True):
-                st.session_state["__chip_query"] = s
-                st.rerun()
+                run_query(s)
 
 render_followups()
-
-chip_q = st.session_state.pop("__chip_query", None)
-if chip_q: run_query(chip_q)
