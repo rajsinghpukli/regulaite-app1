@@ -1,159 +1,125 @@
 from __future__ import annotations
-import os, json
-from typing import Dict, Any, List, Optional
+import os, json, re
+from typing import Dict, Any, List, Optional, Union
 from openai import OpenAI
-from .schema import RegulAIteAnswer
+from pydantic import ValidationError
+from .schema import RegulAIteAnswer, DEFAULT_EMPTY
 from .agents import build_system_instruction
 from .router import normalize_mode
 from .websearch import ddg_search
 
 client = OpenAI()
 
-
-# ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
-    """Convert chat history to compact form for context injection."""
     if not history:
         return ""
     turns = history[-(max_pairs * 2):]
     lines: List[str] = []
     for h in turns:
-        role = "User" if h["role"] == "user" else "Assistant"
-        text = h["content"].replace("\n", " ")
-        lines.append(f"{role}: {text}")
-    return "\n".join(lines)
+        role = h.get("role")
+        content = (h.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"User: {content}")
+        else:
+            lines.append(f"Assistant: {content[:600]}")
+    return "\n".join(lines[-(max_pairs * 2):])
 
-
-def _maybe_json_parse(s: str) -> Dict[str, Any]:
-    try:
-        return json.loads(s)
-    except Exception:
+def _parse_json(text: str) -> Dict[str, Any]:
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
         return {}
+    raw = m.group(0)
+    try:
+        return json.loads(raw)
+    except Exception:
+        raw = re.sub(r",\s*}", "}", raw)
+        raw = re.sub(r",\s*]", "]", raw)
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
 
+def _mode_tokens(mode: str) -> int:
+    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 1600)
 
-# ---------- main ----------
+def _auto_enable_web(query: str, mode: str) -> bool:
+    q = (query or "").lower()
+    if mode == "research":
+        return True
+    for t in ("latest", "recent", "update", "today", "news"):
+        if t in q:
+            return True
+    if "http://" in q or "https://" in q:
+        return True
+    return False
+
 def ask(
     query: str,
-    user_id: Optional[str] = None,   # ✅ added back
+    *,
+    user_id: Optional[str] = None,
     history: Optional[List[Dict[str, str]]] = None,
-    mode: str = "default",
+    mode: str = "long",
+    k_hint: int = 12,
+    evidence_mode: bool = True,
+    web_enabled: Union[bool, str] = True,
+    vec_id: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> RegulAIteAnswer:
-    """Main pipeline: enrich → retrieve → draft → structure → return."""
-    history = history or []
     mode = normalize_mode(mode)
+    convo_brief = _history_to_brief(history or [])
+    max_out = _mode_tokens(mode)
 
-    # Build system instruction
-    sys_msg = build_system_instruction(mode=mode)
-
-    # History context
-    history_brief = _history_to_brief(history)
-
-    # Step 1: Enrichment
-    enrich_prompt = f"""
-You are assisting with regulatory Q&A.
-Query: {query}
-History: {history_brief}
-
-Rewrite into 2-3 enriched search queries (precise, regulatory terms, synonyms).
-Output as JSON list.
-"""
-    enr = client.responses.create(
-        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
-        input=[{"role": "system", "content": sys_msg},
-               {"role": "user", "content": enrich_prompt}],
+    sys_inst = build_system_instruction(
+        k_hint=k_hint,
+        evidence_mode=evidence_mode,
+        mode=mode,
     )
+
+    use_web = True if web_enabled else _auto_enable_web(query, mode)
+    web_context = ""
+    if use_web:
+        results = ddg_search(query, max_results=10)
+        if results:
+            lines = ["Web snippets (vector store still primary):"]
+            for i, r in enumerate(results, 1):
+                snippet = (r.get("snippet") or "").strip()[:400]
+                url = r.get("url") or ""
+                lines.append(f"{i}. {snippet} ({url})")
+            web_context = "\n".join(lines)
+
+    messages = [
+        {"role": "system", "content": sys_inst},
+        {"role": "user", "content": f"Conversation so far:\n{convo_brief}"},
+    ]
+    if web_context:
+        messages.append({"role": "user", "content": web_context})
+    messages.append({"role": "user", "content": query})
+
+    chat_model = (model or os.getenv("RESPONSES_MODEL") or "gpt-4.1-mini").strip()
+
+    resp = client.chat.completions.create(
+        model=chat_model,
+        temperature=0.3,
+        max_tokens=max_out,
+        messages=messages,
+    )
+
+    text = ""
     try:
-        search_queries = json.loads(enr.output_text.strip())
-        if not isinstance(search_queries, list):
-            search_queries = [query]
+        text = resp.choices[0].message.content or ""
     except Exception:
-        search_queries = [query]
+        text = ""
 
-    # Step 2: Retrieval (vector + web always)
-    evidence_chunks: List[str] = []
-    try:
-        from openai import VectorStore
-        vs_id = os.getenv("OPENAI_VECTOR_STORE_ID")
-        if vs_id:
-            vs = VectorStore(vs_id)
-            for sq in search_queries:
-                results = vs.similarity_search(sq, k=12)
-                for r in results:
-                    snippet = r["document"]["text"][:500]
-                    evidence_chunks.append(snippet)
-    except Exception:
-        pass
+    data = _parse_json(text or "")
+    if data:
+        try:
+            return RegulAIteAnswer(**data)
+        except ValidationError:
+            pass
 
-    # Web search
-    web_snippets = []
-    for sq in search_queries[:2]:
-        web_snippets.extend(ddg_search(sq))
-    evidence_chunks.extend(web_snippets[:5])
-
-    evidence_text = "\n\n".join(evidence_chunks[:15])
-
-    # Step 3: Draft answer
-    draft_prompt = f"""
-Answer the user's question in long, structured, ChatGPT-style form.
-
-User question: {query}
-
-Relevant evidence:
-{evidence_text}
-
-Instructions:
-- Provide a detailed narrative with headings, bullet points, and tables where useful.
-- Always include: (a) structured overview per framework, (b) comparison table, 
-  (c) short approval workflow + reporting matrix if relevant, (d) recommendation for Khaleeji Bank.
-- If evidence is missing, gracefully infer from general knowledge — never return 'no answer'.
-- Suggest 3-6 follow-up questions at the end.
-Output in Markdown.
-"""
-    draft = client.responses.create(
-        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
-        input=[{"role": "system", "content": sys_msg},
-               {"role": "user", "content": draft_prompt}],
-    )
-    text = draft.output_text.strip()
-
-    # Step 4: Structuring pass
-    struct_prompt = f"""
-Take the following draft answer and reformat into structured JSON.
-
-Draft answer:
-{text}
-
-Output JSON with fields:
-- raw_markdown
-- summary
-- per_source
-- comparison_table_md
-- follow_up_suggestions
-"""
-    struct = client.responses.create(
-        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
-        input=[{"role": "system", "content": sys_msg},
-               {"role": "user", "content": struct_prompt}],
-    )
-    data = _maybe_json_parse(struct.output_text.strip())
-
-    # ✅ Graceful fallback
-    markdown = data.get("raw_markdown", text or "_Answer failed, but no blank output._")
-
-    return RegulAIteAnswer(
-        raw_markdown=markdown,
-        summary=data.get("summary", ""),
-        per_source=data.get("per_source", {}),
-        comparison_table_md=data.get("comparison_table_md", ""),
-        follow_up_suggestions=(
-            data.get("follow_up_suggestions")
-            if data.get("follow_up_suggestions")
-            else [
-                f"What are approval thresholds and board oversight for {query}?",
-                f"Draft a closure checklist for {query} with controls and required evidence.",
-                f"What reporting pack fields should be in the monthly board pack for {query}?",
-                f"How should breaches/exceptions for {query} be escalated and documented?",
-                f"What stress-test scenarios are relevant for {query} and how to calibrate them?",
-            ]
-        ),
-    )
+    # Fallback: return readable ChatGPT-like text
+    if text.strip():
+        return RegulAIteAnswer(raw_markdown=text.strip())
+    return DEFAULT_EMPTY
