@@ -1,5 +1,10 @@
+# app.py
 from __future__ import annotations
 import os
+import json
+import re
+from typing import Any, Dict, List
+
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -23,15 +28,124 @@ PRESET_USERS = {
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
+# ---------- CSS ----------
+CSS = """
+<style>
+.block-container { max-width: 1180px; }
+.badge {
+  display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px;
+  border:1px solid rgba(0,0,0,0.1)
+}
+.badge.ok { background:#ecfdf5;color:#065f46;border-color:#10b98133; }
+.badge.warn { background:#fff7ed;color:#9a3412;border-color:#f59e0b33; }
+.badge.err { background:#fef2f2;color:#991b1b;border-color:#ef444433; }
+.regu-msg { border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px rgba(0,0,0,0.06);
+  border:1px solid rgba(0,0,0,0.06); margin-bottom:10px; }
+.regu-user { background:#f5f7fb; }
+.regu-assistant { background:#ffffff; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3 { margin-top: 1.2rem; }
+.markdown-body p, .markdown-body li { line-height: 1.6; }
+.markdown-body table { width:100%; border-collapse:collapse;}
+.markdown-body th, .markdown-body td { border:1px solid #e5e7eb; padding:8px; font-size:14px;}
+.markdown-body th { background:#f9fafb; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
 # ---------- Session state ----------
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
 if "history" not in st.session_state:
-    st.session_state.history: list[dict] = []
+    st.session_state.history: List[Dict[str, str]] = []
 if "last_answer" not in st.session_state:
     st.session_state.last_answer: RegulAIteAnswer | None = None
+
+# ---------- Helpers ----------
+def _looks_json_like(s: str) -> bool:
+    s = s.strip()
+    return (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))
+
+def _unescape_backslash_newlines(text: str) -> str:
+    # If the string literally contains "\n", map to real newlines
+    # but avoid double-unescaping actual newlines
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    return text
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _format_per_source(per_source: Dict[str, Any]) -> str:
+    if not isinstance(per_source, dict) or not per_source:
+        return ""
+    lines = ["## Evidence by Framework"]
+    for fw, quotes in per_source.items():
+        lines.append(f"**{fw}**")
+        if isinstance(quotes, list):
+            for q in quotes:
+                q_str = str(q)
+                q_str = _unescape_backslash_newlines(q_str)
+                lines.append(f"- {q_str.strip()}")
+    return "\n".join(lines)
+
+def _coerce_answer_to_markdown(ans: RegulAIteAnswer) -> str:
+    """
+    1) Use ans.as_markdown() if it returns clean text.
+    2) If it looks JSON-ish or has visible \n, sanitize.
+    3) If still empty, compose from fields we know.
+    """
+    md = ""
+    try:
+        md = ans.as_markdown() or ""
+    except Exception:
+        md = ""
+
+    md = _strip_code_fences(md)
+    if _looks_json_like(md):
+        # Someone returned JSON inside raw_markdown; ignore and rebuild below
+        md = ""
+
+    if md:
+        return _unescape_backslash_newlines(md).strip()
+
+    # Build from parts if needed
+    parts: List[str] = []
+    summary = getattr(ans, "summary", "") or ""
+    if summary.strip():
+        parts.append("## Summary")
+        parts.append(_unescape_backslash_newlines(summary.strip()))
+
+    cmp_md = getattr(ans, "comparison_table_md", "") or ""
+    if cmp_md.strip():
+        parts.append("## Comparison")
+        parts.append(_unescape_backslash_newlines(cmp_md.strip()))
+
+    per_source = getattr(ans, "per_source", {}) or {}
+    ps = _format_per_source(per_source)
+    if ps:
+        parts.append(ps)
+
+    raw_md = getattr(ans, "raw_markdown", "") or ""
+    if raw_md.strip():
+        parts.append(_unescape_backslash_newlines(_strip_code_fences(raw_md.strip())))
+
+    # Fallback message
+    if not parts:
+        parts.append("_No answer produced._")
+
+    return "\n\n".join(parts).strip()
+
+def render_message(role: str, content_md: str):
+    klass = "regu-user" if role == "user" else "regu-assistant"
+    st.markdown(f'<div class="regu-msg {klass}">', unsafe_allow_html=True)
+    st.markdown(f'<div class="markdown-body">{content_md}</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- Login ----------
 def auth_ui():
@@ -75,12 +189,16 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Status")
-    st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
-    st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
+    st.markdown(
+        f"""
+        <span class="badge {'ok' if VECTOR_STORE_ID else 'warn'}">Vector store: {'connected' if VECTOR_STORE_ID else 'not connected'}</span>
+        <span class="badge {'ok' if LLM_KEY_AVAILABLE else 'err'}">LLM API key: {'available' if LLM_KEY_AVAILABLE else 'missing'}</span>
+        """,
+        unsafe_allow_html=True
+    )
 
 # ---------- Main ----------
 st.markdown(f"## {APP_NAME}")
-
 query = st.text_input(
     "Ask a question",
     placeholder="e.g., According to the CBB Rulebook, what are disclosure requirements for large exposures (compare with Basel)?",
@@ -108,18 +226,14 @@ def run_query(q: str):
             model=DEFAULT_MODEL,
         )
 
-    # always render as ChatGPT-style Markdown
-    md = (ans.as_markdown() or "").strip()
-    if not md:
-        md = "_No answer produced._"
-
+    # Normalize to clean markdown always
+    md = _coerce_answer_to_markdown(ans)
     append_turn(USER, "assistant", md)
     st.session_state.history.append({"role": "assistant", "content": md})
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
-    # show the message immediately
-    st.chat_message("assistant").write(md)
+    render_message("assistant", md)
 
 # Ask button
 cols = st.columns([1, 6])
@@ -129,16 +243,13 @@ with cols[0]:
 
 # Render history so far
 for turn in st.session_state.history:
-    if turn["role"] == "user":
-        st.chat_message("user").write(turn["content"])
-    else:
-        st.chat_message("assistant").write(turn["content"])
+    render_message(turn["role"], turn["content"])
 
 # Follow-up chips (always show something, with unique keys)
 def render_followups():
-    suggs: list[str] = []
+    suggs: List[str] = []
     if isinstance(st.session_state.last_answer, RegulAIteAnswer):
-        suggs = st.session_state.last_answer.follow_up_suggestions or []
+        suggs = getattr(st.session_state.last_answer, "follow_up_suggestions", None) or []
     if not suggs:
         topic = (query or "this topic").strip()
         suggs = [
