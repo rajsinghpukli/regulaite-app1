@@ -11,7 +11,6 @@ from .prompts import STYLE_GUIDE, FEW_SHOT_EXAMPLE
 
 client = OpenAI()
 
-# ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     if not history:
         return ""
@@ -34,42 +33,15 @@ def _schema_dict() -> Dict[str, Any]:
         "properties": {
             "raw_markdown": {"type": "string"},
             "summary": {"type": "string"},
-            "per_source": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "properties": {
-                        "notes": {"type": "string"},
-                        "quotes": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "framework": {"type": "string", "enum": ["IFRS","AAOIFI","CBB","InternalPolicy"]},
-                                    "snippet": {"type": "string"},
-                                    "citation": {"type": "string"},
-                                },
-                                "required": ["framework", "snippet"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            },
+            "per_source": {"type": "object"},
             "comparison_table_md": {"type": "string"},
             "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["raw_markdown", "summary", "per_source", "follow_up_suggestions"],
-        "additionalProperties": True,
     }
 
 def _schema_prompt() -> str:
-    return (
-        "Return ONE JSON object that exactly matches this JSON Schema. "
-        "No analysis before/after the JSON; no markdown outside string fields.\n\n"
-        + json.dumps(_schema_dict(), ensure_ascii=False)
-    )
+    return "Return ONE JSON object that matches this schema only:\n" + json.dumps(_schema_dict())
 
 def _parse_json(text: str) -> Dict[str, Any]:
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
@@ -87,9 +59,8 @@ def _parse_json(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 2000)
+    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 2200)
 
-# ---------- main ----------
 def ask(
     query: str,
     *,
@@ -108,11 +79,10 @@ def ask(
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # --- Web context always on ---
     web_context = ""
     results = ddg_search(query, max_results=k_hint)
     if results:
-        lines = ["Web snippets (vector store takes precedence):"]
+        lines = ["Web snippets (vector store is primary):"]
         for i, r in enumerate(results, 1):
             snippet = (r.get("snippet") or "").strip()[:400]
             title = r.get("title") or ""
@@ -120,20 +90,22 @@ def ask(
             lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
         web_context = "\n".join(lines)
 
-    # --- Chat messages ---
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
         {"role": "system", "content": FEW_SHOT_EXAMPLE},
         {"role": "system", "content": _schema_prompt()},
         {"role": "system", "content": (
-            "Every answer MUST: "
-            "1. Include a short approval workflow (e.g., Credit → Risk → Shari’ah Supervisory Board → Board → CBB). "
-            "2. Include a reporting matrix (roles, items, frequency). "
-            "3. Adapt tone/length to question context: if regulatory, be formal and detailed; if general/web, be flexible. "
-            "4. Prefer long, ChatGPT-style narrative with headings, bullets, and tables when helpful."
+            "Every answer must be a long, ChatGPT-style narrative with:\n"
+            "- Headings & subheadings\n"
+            "- Evidence quotes with inline citations\n"
+            "- A comparison table (if >1 framework)\n"
+            "- A short approval workflow (Credit → Risk → Shari’ah Board → Board → CBB)\n"
+            "- A reporting matrix (Owner | Item | Frequency)\n"
+            "- 4–6 follow-up questions\n"
+            "Do not output plain prose outside JSON."
         )},
-        {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
+        {"role": "user", "content": f"Conversation so far:\n{convo_brief}"},
     ]
     if web_context:
         messages.append({"role": "user", "content": web_context})
@@ -149,13 +121,22 @@ def ask(
         messages=messages,
     )
 
-    text = ""
-    try:
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        text = ""
+    text = resp.choices[0].message.content or ""
+    data = _parse_json(text)
+    if not data:
+        # Retry once with stronger JSON warning
+        retry_messages = messages + [
+            {"role": "system", "content": "⚠️ WARNING: You must return ONLY one valid JSON object. No markdown outside JSON."}
+        ]
+        resp2 = client.chat.completions.create(
+            model=chat_model,
+            temperature=0.35,
+            max_tokens=max_out,
+            messages=retry_messages,
+        )
+        text = resp2.choices[0].message.content or ""
+        data = _parse_json(text)
 
-    data = _parse_json(text or "")
     if not data:
         return DEFAULT_EMPTY
     try:
