@@ -4,8 +4,29 @@ from typing import Dict, Any, Tuple
 
 BASE_DIR = os.path.dirname(__file__)
 USERS_PATH = os.path.join(BASE_DIR, "users.json")
-ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "true").lower() == "true"
+
+# 👇 Pilot behaviour: SIGN-UP HIDDEN/DISABLED in UI, but code path kept for future
+ALLOW_SIGNUP = False  # override later via env/UI when you open access
+
 PEPPER = os.getenv("PASSWORD_PEPPER", "")  # optional extra secret
+
+# Predefined pilot logins (override via AUTH_USERS env: "user1:pass1,user2:pass2,...")
+DEFAULT_FIXED = {
+    "amit": "Khaleeji#2025",
+    "raj": "RegulAIte#Dev",
+    "review": "POC#Access",
+}
+
+def _env_fixed() -> Dict[str, str]:
+    env = os.getenv("AUTH_USERS", "").strip()
+    if not env:
+        return DEFAULT_FIXED
+    out: Dict[str, str] = {}
+    for pair in env.split(","):
+        if ":" in pair:
+            u, p = pair.split(":", 1)
+            out[u.strip()] = p.strip()
+    return out or DEFAULT_FIXED
 
 def _load() -> Dict[str, Any]:
     if not os.path.exists(USERS_PATH):
@@ -27,6 +48,7 @@ def _hash(password: str, salt: str) -> str:
     return hashlib.sha256((salt + password + PEPPER).encode("utf-8")).hexdigest()
 
 def ensure_bootstrap_admin() -> None:
+    # still supported for later; does nothing in pilot unless BASIC_* set
     data = _load()
     users = data.get("users", {})
     admin_user = os.getenv("BASIC_USER")
@@ -43,9 +65,15 @@ def ensure_bootstrap_admin() -> None:
         _save(data)
 
 def username_exists(username: str) -> bool:
+    # kept for future; checks dynamic store only
     return username in _load().get("users", {})
 
 def verify_user(username: str, password: str) -> bool:
+    # Pilot: fixed accounts take precedence
+    fixed = _env_fixed()
+    if username in fixed and password == fixed[username]:
+        return True
+    # Fallback to dynamic store (kept for future)
     users = _load().get("users", {})
     u = users.get(username)
     if not u:
@@ -54,7 +82,7 @@ def verify_user(username: str, password: str) -> bool:
 
 def create_user_if_allowed(username: str, password: str) -> Tuple[bool, str]:
     if not ALLOW_SIGNUP:
-        return False, "Sign-up is disabled."
+        return False, "Sign-up is disabled for the pilot."
     if not username or not password:
         return False, "Username and password required."
     data = _load()
