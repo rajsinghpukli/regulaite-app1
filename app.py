@@ -17,7 +17,7 @@ DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
-# Seed an admin if env vars provided
+# Seed admin
 ensure_bootstrap_admin()
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
@@ -53,7 +53,7 @@ USER = st.session_state.user_id
 if "history" not in st.session_state:
     st.session_state.history = load_chat(USER)
 if "last_answer" not in st.session_state:
-    st.session_state.last_answer = None  # RegulAIteAnswer
+    st.session_state.last_answer = None
 
 # -------- Sidebar --------
 with st.sidebar:
@@ -79,40 +79,42 @@ with st.sidebar:
         st.warning("Vector store: not connected")
     st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
-# -------- Main --------
+# -------- Chat history --------
 st.markdown(f"## {APP_NAME}")
-query = st.text_input("Ask a question", placeholder="e.g., Connected counterparties completion/closure controls…")
 
-cols = st.columns([1, 6])
-with cols[0]:
-    ask_clicked = st.button("Ask", type="primary", use_container_width=True)
-
-# Render history
 for turn in st.session_state.history:
     if turn["role"] == "user":
         st.chat_message("user").write(turn["content"])
     else:
         st.chat_message("assistant").write(turn["content"])
 
-# Follow-up chips
-def render_followups():
-    suggs: list[str] = []
-    if isinstance(st.session_state.last_answer, RegulAIteAnswer):
-        suggs = st.session_state.last_answer.follow_up_suggestions or []
-    if not suggs:
-        return
-    st.caption("Try a follow-up:")
-    chip_cols = st.columns(3)
-    for i, s in enumerate(suggs[:6]):
-        with chip_cols[i % 3]:
-            if st.button(s, key=f"chip_{i}", use_container_width=True):
-                st.session_state["__chip_query"] = s
+        # Follow-ups appear directly under the assistant message
+        if st.session_state.last_answer and isinstance(st.session_state.last_answer, RegulAIteAnswer):
+            suggs = st.session_state.last_answer.follow_up_suggestions or []
+            if suggs:
+                st.caption("Try a follow-up:")
+                chip_cols = st.columns(3)
+                for i, s in enumerate(suggs[:6]):
+                    with chip_cols[i % 3]:
+                        if st.button(s, key=f"chip_{i}", use_container_width=True):
+                            st.session_state["__chip_query"] = s
+                            st.rerun()
 
-render_followups()
+# -------- Input (sticky at bottom) --------
+st.markdown("---")
+query = st.text_input(
+    "Ask a question",
+    placeholder="e.g., Connected counterparties completion/closure controls…",
+    key="main_query",
+)
 
+if st.button("Ask", type="primary", use_container_width=True):
+    if query.strip():
+        st.session_state["__new_query"] = query
+        st.rerun()
+
+# -------- Handle queries --------
 def run_query(q: str):
-    if not q.strip():
-        return
     append_turn(USER, "user", q)
     st.session_state.history.append({"role": "user", "content": q})
     save_chat(USER, st.session_state.history)
@@ -132,13 +134,10 @@ def run_query(q: str):
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
-    st.chat_message("assistant").write(md)
-    render_followups()
+    st.rerun()
 
-# Handle Ask + chip queries
-if ask_clicked and query:
-    run_query(query)
+if "__new_query" in st.session_state:
+    run_query(st.session_state.pop("__new_query"))
 
-chip_q = st.session_state.pop("__chip_query", None)
-if chip_q:
-    run_query(chip_q)
+if "__chip_query" in st.session_state:
+    run_query(st.session_state.pop("__chip_query"))
