@@ -1,177 +1,165 @@
 from __future__ import annotations
 import os, json, re
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 from openai import OpenAI
 from pydantic import ValidationError
 from .schema import RegulAIteAnswer, DEFAULT_EMPTY
 from .agents import build_system_instruction
 from .router import normalize_mode
 from .websearch import ddg_search
-from .prompts import STYLE_GUIDE, FEW_SHOT_EXAMPLE
 
 client = OpenAI()
 
 # ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
+    """Convert chat history to a compact prompt string."""
     if not history:
         return ""
     turns = history[-(max_pairs * 2):]
     lines: List[str] = []
     for h in turns:
-        role = h.get("role")
-        content = (h.get("content") or "").strip()
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"User asked: {content}")
-        else:
-            lines.append(f"Assistant replied (extract): {content[:700]}")
-    return "\n".join(lines[-(max_pairs * 2):])
+        role = "User" if h["role"] == "user" else "Assistant"
+        text = h["content"].replace("\n", " ")
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
 
-def _schema_dict() -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "raw_markdown": {"type": "string"},
-            "summary": {"type": "string"},
-            "per_source": {"type": "object"},
-            "comparison_table_md": {"type": "string"},
-            "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["raw_markdown", "summary", "per_source", "follow_up_suggestions"],
-    }
 
-def _schema_prompt() -> str:
-    return (
-        "Return ONE JSON object that matches this schema only:\n"
-        + json.dumps(_schema_dict(), ensure_ascii=False)
-        + "\nDo not output plain text outside the JSON."
-    )
-
-def _parse_json(text: str) -> Dict[str, Any]:
-    """Try to extract and parse JSON from model output, with cleanup."""
-    if not text:
-        return {}
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        return {}
-    raw = m.group(0)
+def _maybe_json_parse(s: str) -> Dict[str, Any]:
     try:
-        return json.loads(raw)
+        return json.loads(s)
     except Exception:
-        # Try some repairs
-        raw = re.sub(r",\s*}", "}", raw)
-        raw = re.sub(r",\s*]", "]", raw)
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {}
+        return {}
 
-def _mode_tokens(mode: str) -> int:
-    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 2200)
 
 # ---------- main ----------
 def ask(
     query: str,
-    *,
-    user_id: str,
-    history: List[Dict[str, str]],
-    k_hint: int = 12,
-    evidence_mode: bool = True,
-    mode_hint: str | None = "long",
-    web_enabled: Union[bool, str] = True,
-    vec_id: Optional[str] = None,
-    model: Optional[str] = None,
+    history: Optional[List[Dict[str, str]]] = None,
+    mode: str = "default",
 ) -> RegulAIteAnswer:
-    mode = normalize_mode(mode_hint)
-    convo_brief = _history_to_brief(history)
-    max_out = _mode_tokens(mode)
+    """Main pipeline: query enrichment, retrieval, answer drafting."""
+    history = history or []
+    mode = normalize_mode(mode)
 
-    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
+    # Build system instruction
+    sys_msg = build_system_instruction(mode=mode)
 
-    # --- Web context always on ---
-    web_context = ""
-    results = ddg_search(query, max_results=k_hint)
-    if results:
-        lines = ["Web snippets (vector store is primary):"]
-        for i, r in enumerate(results, 1):
-            snippet = (r.get("snippet") or "").strip()[:400]
-            title = r.get("title") or ""
-            url = r.get("url") or ""
-            lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
-        web_context = "\n".join(lines)
+    # History context
+    history_brief = _history_to_brief(history)
 
-    # --- Chat messages ---
-    messages = [
-        {"role": "system", "content": sys_inst},
-        {"role": "system", "content": STYLE_GUIDE},
-        {"role": "system", "content": FEW_SHOT_EXAMPLE},
-        {"role": "system", "content": _schema_prompt()},
-        {"role": "system", "content": (
-            "Every answer must be a long, ChatGPT-style narrative with:\n"
-            "- Headings & subheadings\n"
-            "- Evidence quotes with inline citations\n"
-            "- A comparison table (if >1 framework)\n"
-            "- A short approval workflow (Credit → Risk → Shari’ah Board → Board → CBB)\n"
-            "- A reporting matrix (Owner | Item | Frequency)\n"
-            "- 4–6 follow-up questions\n"
-            "If JSON schema fails, retry once. If still failing, output full answer as raw_markdown."
-        )},
-        {"role": "user", "content": f"Conversation so far:\n{convo_brief}"},
-    ]
-    if web_context:
-        messages.append({"role": "user", "content": web_context})
-    messages.append({"role": "user", "content": query})
+    # Step 1: Enrichment
+    enrich_prompt = f"""
+You are assisting with regulatory Q&A.
+Query: {query}
+History: {history_brief}
 
-    chat_model = (model or os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
-
-    resp = client.chat.completions.create(
-        model=chat_model,
-        temperature=0.35,
-        top_p=0.95,
-        max_tokens=max_out,
-        messages=messages,
+Rewrite into 2-3 enriched search queries (precise, regulatory terms, synonyms).
+Output as JSON list.
+"""
+    enr = client.responses.create(
+        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
+        input=[{"role": "system", "content": sys_msg},
+               {"role": "user", "content": enrich_prompt}],
     )
+    enr_text = enr.output_text.strip()
+    try:
+        search_queries = json.loads(enr_text)
+        if not isinstance(search_queries, list):
+            search_queries = [query]
+    except Exception:
+        search_queries = [query]
 
-    text = resp.choices[0].message.content or ""
+    # Step 2: Retrieval (vector + web always)
+    evidence_chunks: List[str] = []
+    try:
+        from openai import VectorStore
+        vs_id = os.getenv("OPENAI_VECTOR_STORE_ID")
+        if vs_id:
+            vs = VectorStore(vs_id)
+            for sq in search_queries:
+                results = vs.similarity_search(sq, k=12)
+                for r in results:
+                    snippet = r["document"]["text"][:500]
+                    evidence_chunks.append(snippet)
+    except Exception:
+        pass
 
-    # ---- Try to parse JSON ----
-    data = _parse_json(text)
-    if data:
-        try:
-            return RegulAIteAnswer(**data)
-        except ValidationError:
-            pass
+    # Always add web search
+    web_snippets = []
+    for sq in search_queries[:2]:
+        web_snippets.extend(ddg_search(sq))
+    evidence_chunks.extend(web_snippets[:5])
 
-    # ---- Retry once with stricter JSON warning ----
-    retry_messages = messages + [
-        {"role": "system", "content": "⚠️ You must return ONLY one valid JSON object. Start with { and end with }."}
-    ]
-    resp2 = client.chat.completions.create(
-        model=chat_model,
-        temperature=0.35,
-        top_p=0.9,
-        max_tokens=max_out,
-        messages=retry_messages,
+    evidence_text = "\n\n".join(evidence_chunks[:15])
+
+    # Step 3: Draft answer
+    draft_prompt = f"""
+Answer the user's question in long, structured, ChatGPT-style form.
+
+User question: {query}
+
+Relevant evidence:
+{evidence_text}
+
+Instructions:
+- Provide a detailed narrative answer with headings, bullet points, and tables where useful.
+- Always include: (a) structured overview per framework, (b) comparison table, (c) short approval workflow + reporting matrix if relevant, and (d) recommendation for Khaleeji Bank.
+- If evidence is missing, gracefully infer from general knowledge — never return 'no answer'.
+- Maintain professional explanatory style.
+- Suggest 3-6 follow-up questions at the end.
+Output in Markdown.
+"""
+
+    draft = client.responses.create(
+        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
+        input=[{"role": "system", "content": sys_msg},
+               {"role": "user", "content": draft_prompt}],
     )
-    text2 = resp2.choices[0].message.content or ""
-    data2 = _parse_json(text2)
-    if data2:
-        try:
-            return RegulAIteAnswer(**data2)
-        except ValidationError:
-            pass
+    text = draft.output_text.strip()
+
+    # Step 4: Secondary structuring pass
+    struct_prompt = f"""
+Take the following draft answer and reformat into structured JSON.
+
+Draft answer:
+{text}
+
+Output JSON with fields:
+- raw_markdown: full Markdown version of the answer (narrative, tables, workflows).
+- summary: short executive summary.
+- per_source: mapping of framework → list of 2-5 short evidence quotes.
+- comparison_table_md: Markdown table if available.
+- follow_up_suggestions: list of 3-6 follow-up questions.
+"""
+    struct = client.responses.create(
+        model=os.getenv("RESPONSES_MODEL", "gpt-4o-mini"),
+        input=[{"role": "system", "content": sys_msg},
+               {"role": "user", "content": struct_prompt}],
+    )
+    struct_text = struct.output_text.strip()
+    data = _maybe_json_parse(struct_text)
 
     # ---- Graceful fallback ----
+    markdown = ""
+    if isinstance(data, dict) and "raw_markdown" in data:
+        markdown = data["raw_markdown"]
+    else:
+        markdown = text or "_Answer failed, but no blank output._"
+
     return RegulAIteAnswer(
-        raw_markdown=(text2 or text or "_Answer failed, but no blank output._"),
-        summary="",
-        per_source={},
-        follow_up_suggestions=[
-            f"What are approval thresholds and board oversight for {query}?",
-            f"Draft a closure checklist for {query} with controls and required evidence.",
-            f"What reporting pack fields should be in the monthly board pack for {query}?",
-            f"How should breaches/exceptions for {query} be escalated and documented?",
-            f"What stress-test scenarios are relevant for {query} and how to calibrate them?",
-        ],
+        raw_markdown=markdown,
+        summary=data.get("summary", "") if isinstance(data, dict) else "",
+        per_source=data.get("per_source", {}) if isinstance(data, dict) else {},
+        comparison_table_md=data.get("comparison_table_md", "") if isinstance(data, dict) else "",
+        follow_up_suggestions=(
+            data.get("follow_up_suggestions")
+            if isinstance(data, dict) and data.get("follow_up_suggestions")
+            else [
+                f"What are approval thresholds and board oversight for {query}?",
+                f"Draft a closure checklist for {query} with controls and required evidence.",
+                f"What reporting pack fields should be in the monthly board pack for {query}?",
+                f"How should breaches/exceptions for {query} be escalated and documented?",
+                f"What stress-test scenarios are relevant for {query} and how to calibrate them?",
+            ]
+        ),
     )
