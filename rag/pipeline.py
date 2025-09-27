@@ -13,6 +13,7 @@ client = OpenAI()
 
 # ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
+    """Convert last few turns of history into a compact text summary."""
     if not history:
         return ""
     turns = history[-(max_pairs * 2):]
@@ -29,6 +30,7 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
     return "\n".join(lines[-(max_pairs * 2):])
 
 def _schema_dict() -> Dict[str, Any]:
+    """Schema we ask the model to return."""
     return {
         "type": "object",
         "properties": {
@@ -62,17 +64,19 @@ def _schema_dict() -> Dict[str, Any]:
     }
 
 def _schema_prompt() -> str:
+    """Prompt asking model to respect memo style and schema."""
     style_bar = (
         "STYLE DIRECTIVES:\n"
-        "- Write as a flowing regulatory memo (sections, table, recommendation).\n"
+        "- Write as a regulatory memo (sections, table, recommendation).\n"
         "- Always include either a workflow or reporting matrix in recommendations.\n"
-        "- No 'Meaning:' lines. Integrate interpretation into narrative.\n"
+        "- No 'Meaning:' lines. Integrate interpretation into prose.\n"
         "- Use compact inline citations like [IFRS 7 §35].\n"
         "- Omit frameworks if no evidence, never write 'N/A'.\n"
     )
     return style_bar + "\nReturn ONE JSON object only:\n" + json.dumps(_schema_dict(), ensure_ascii=False)
 
 def _parse_json(text: str) -> Dict[str, Any]:
+    """Extract and parse JSON from model output."""
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -80,6 +84,7 @@ def _parse_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
+        # clean trailing commas
         raw = re.sub(r",\s*}", "}", raw)
         raw = re.sub(r",\s*]", "]", raw)
         try:
@@ -103,13 +108,14 @@ def ask(
     vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
+    """Main entry: answer a user query as a structured regulatory memo."""
     mode = normalize_mode(mode_hint or "research")
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # Web enrichment (always on)
+    # --- Web enrichment (always on) ---
     results = ddg_search(query, max_results=max(8, k_hint))
     web_context = ""
     if results:
@@ -151,7 +157,7 @@ def ask(
     if not data:
         return DEFAULT_EMPTY
 
-    # Guarantee follow-ups
+    # --- Guarantee follow-ups ---
     if not data.get("follow_up_suggestions"):
         topic = query.strip() or "this topic"
         data["follow_up_suggestions"] = [
@@ -161,6 +167,17 @@ def ask(
             f"Suggest KRIs and thresholds for {topic}.",
             f"Outline escalation and breach handling steps for {topic}.",
         ]
+
+    # --- Guarantee recommendation section in raw_markdown ---
+    raw_md = (data.get("raw_markdown") or "").strip()
+    if "Recommendation for Khaleeji Bank" not in raw_md:
+        rec_text = (
+            "\n\n### Recommendation for Khaleeji Bank\n"
+            "- Establish board-approved policy thresholds (10% reporting, 25% max exposure).\n"
+            "- Require connected exposures to go through Credit → Risk → Board → CBB notification.\n"
+            "- Maintain a reporting matrix showing which exposures go to which committee and how often.\n"
+        )
+        data["raw_markdown"] = raw_md + rec_text
 
     try:
         return RegulAIteAnswer(**data)
