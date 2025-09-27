@@ -13,7 +13,6 @@ client = OpenAI()
 
 # ---------- helpers ----------
 def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
-    """Convert last few turns of history into a compact text summary."""
     if not history:
         return ""
     turns = history[-(max_pairs * 2):]
@@ -26,11 +25,10 @@ def _history_to_brief(history: List[Dict[str, str]], max_pairs: int = 8) -> str:
         if role == "user":
             lines.append(f"User asked: {content}")
         else:
-            lines.append(f"Assistant replied (extract): {content[:600]}")
+            lines.append(f"Assistant replied (extract): {content[:700]}")
     return "\n".join(lines[-(max_pairs * 2):])
 
 def _schema_dict() -> Dict[str, Any]:
-    """Schema we ask the model to return."""
     return {
         "type": "object",
         "properties": {
@@ -52,31 +50,28 @@ def _schema_dict() -> Dict[str, Any]:
                                     "citation": {"type": "string"},
                                 },
                                 "required": ["framework", "snippet"],
+                                "additionalProperties": False,
                             },
                         },
                     },
+                    "additionalProperties": False,
                 },
             },
             "comparison_table_md": {"type": "string"},
             "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["raw_markdown", "summary", "per_source", "follow_up_suggestions"],
+        "additionalProperties": True,
     }
 
 def _schema_prompt() -> str:
-    """Prompt asking model to respect memo style and schema."""
-    style_bar = (
-        "STYLE DIRECTIVES:\n"
-        "- Write as a regulatory memo (sections, table, recommendation).\n"
-        "- Always include either a workflow or reporting matrix in recommendations.\n"
-        "- No 'Meaning:' lines. Integrate interpretation into prose.\n"
-        "- Use compact inline citations like [IFRS 7 §35].\n"
-        "- Omit frameworks if no evidence, never write 'N/A'.\n"
+    return (
+        "Return ONE JSON object that exactly matches this JSON Schema. "
+        "No analysis before/after the JSON; no markdown outside string fields.\n\n"
+        + json.dumps(_schema_dict(), ensure_ascii=False)
     )
-    return style_bar + "\nReturn ONE JSON object only:\n" + json.dumps(_schema_dict(), ensure_ascii=False)
 
 def _parse_json(text: str) -> Dict[str, Any]:
-    """Extract and parse JSON from model output."""
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -84,7 +79,6 @@ def _parse_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
-        # clean trailing commas
         raw = re.sub(r",\s*}", "}", raw)
         raw = re.sub(r",\s*]", "]", raw)
         try:
@@ -93,7 +87,7 @@ def _parse_json(text: str) -> Dict[str, Any]:
             return {}
 
 def _mode_tokens(mode: str) -> int:
-    return {"short": 900, "long": 2200, "research": 3200}.get(mode, 2600)
+    return {"short": 900, "long": 2600, "research": 3800}.get(mode, 2000)
 
 # ---------- main ----------
 def ask(
@@ -103,23 +97,22 @@ def ask(
     history: List[Dict[str, str]],
     k_hint: int = 12,
     evidence_mode: bool = True,
-    mode_hint: str | None = "research",
+    mode_hint: str | None = "long",
     web_enabled: Union[bool, str] = True,
     vec_id: Optional[str] = None,
     model: Optional[str] = None,
 ) -> RegulAIteAnswer:
-    """Main entry: answer a user query as a structured regulatory memo."""
-    mode = normalize_mode(mode_hint or "research")
+    mode = normalize_mode(mode_hint)
     convo_brief = _history_to_brief(history)
     max_out = _mode_tokens(mode)
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    # --- Web enrichment (always on) ---
-    results = ddg_search(query, max_results=max(8, k_hint))
+    # --- Web context always on ---
     web_context = ""
+    results = ddg_search(query, max_results=k_hint)
     if results:
-        lines = ["Web snippets (use prudently; internal docs take precedence):"]
+        lines = ["Web snippets (vector store takes precedence):"]
         for i, r in enumerate(results, 1):
             snippet = (r.get("snippet") or "").strip()[:400]
             title = r.get("title") or ""
@@ -127,11 +120,19 @@ def ask(
             lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
         web_context = "\n".join(lines)
 
+    # --- Chat messages ---
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
         {"role": "system", "content": FEW_SHOT_EXAMPLE},
         {"role": "system", "content": _schema_prompt()},
+        {"role": "system", "content": (
+            "Every answer MUST: "
+            "1. Include a short approval workflow (e.g., Credit → Risk → Shari’ah Supervisory Board → Board → CBB). "
+            "2. Include a reporting matrix (roles, items, frequency). "
+            "3. Adapt tone/length to question context: if regulatory, be formal and detailed; if general/web, be flexible. "
+            "4. Prefer long, ChatGPT-style narrative with headings, bullets, and tables when helpful."
+        )},
         {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
     ]
     if web_context:
@@ -139,6 +140,7 @@ def ask(
     messages.append({"role": "user", "content": query})
 
     chat_model = (model or os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
+
     resp = client.chat.completions.create(
         model=chat_model,
         temperature=0.35,
@@ -156,29 +158,6 @@ def ask(
     data = _parse_json(text or "")
     if not data:
         return DEFAULT_EMPTY
-
-    # --- Guarantee follow-ups ---
-    if not data.get("follow_up_suggestions"):
-        topic = query.strip() or "this topic"
-        data["follow_up_suggestions"] = [
-            f"Draft a policy workflow for approvals of {topic}.",
-            f"Design a board/committee reporting matrix for {topic}.",
-            f"List audit pitfalls and lessons for {topic}.",
-            f"Suggest KRIs and thresholds for {topic}.",
-            f"Outline escalation and breach handling steps for {topic}.",
-        ]
-
-    # --- Guarantee recommendation section in raw_markdown ---
-    raw_md = (data.get("raw_markdown") or "").strip()
-    if "Recommendation for Khaleeji Bank" not in raw_md:
-        rec_text = (
-            "\n\n### Recommendation for Khaleeji Bank\n"
-            "- Establish board-approved policy thresholds (10% reporting, 25% max exposure).\n"
-            "- Require connected exposures to go through Credit → Risk → Board → CBB notification.\n"
-            "- Maintain a reporting matrix showing which exposures go to which committee and how often.\n"
-        )
-        data["raw_markdown"] = raw_md + rec_text
-
     try:
         return RegulAIteAnswer(**data)
     except ValidationError:
