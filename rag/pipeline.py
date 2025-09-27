@@ -1,3 +1,4 @@
+# rag/pipeline.py
 from __future__ import annotations
 import os, json, re
 from typing import Dict, Any, List, Optional, Union
@@ -26,7 +27,6 @@ def _history_to_brief(history: List[Dict[str, str]] | None, max_pairs: int = 8) 
         if role == "user":
             lines.append(f"User: {content}")
         else:
-            # small extract to keep prompt size controlled
             lines.append(f"Assistant: {content[:700]}")
     return "\n".join(lines)
 
@@ -64,6 +64,14 @@ def _parse_json(text: str) -> Dict[str, Any]:
 
 def _mode_tokens(mode: str) -> int:
     return {"short": 900, "long": 2600, "research": 3600}.get(mode, 2200)
+
+def _unescape_field(v: Optional[str]) -> Optional[str]:
+    if not isinstance(v, str):
+        return v
+    # Convert visible "\n" into real newlines; keep any existing real newlines as-is.
+    if "\\n" in v and "\n" not in v:
+        v = v.replace("\\n", "\n")
+    return _strip_code_fences(v).strip()
 
 # ---------- main ----------
 def ask(
@@ -105,12 +113,13 @@ def ask(
             lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
         web_context = "\n".join(lines)
 
-    # --- Schema instruction (we'll still render Markdown even if JSON fails) ---
+    # --- Schema instruction (prefer real line breaks in raw_markdown) ---
     schema_msg = (
-        "Return ONE JSON object ONLY with keys:\n"
+        "Return ONE JSON object ONLY with keys: "
         "raw_markdown (string), summary (string), per_source (object), "
-        "comparison_table_md (string, optional), follow_up_suggestions (array of strings).\n"
-        "No prose outside JSON."
+        "comparison_table_md (string, optional), follow_up_suggestions (array of strings). "
+        "IMPORTANT: Use REAL newlines in raw_markdown and comparison_table_md; "
+        "do NOT escape them as \\n. No prose outside JSON."
     )
 
     messages = [
@@ -143,20 +152,28 @@ def ask(
     # Try parse JSON; fallback to clean Markdown
     data = _parse_json(text)
     if data:
+        # Sanitize escaped newlines if model ignored our instruction
+        if "raw_markdown" in data:
+            data["raw_markdown"] = _unescape_field(data.get("raw_markdown"))
+        if "summary" in data:
+            data["summary"] = _unescape_field(data.get("summary"))
+        if "comparison_table_md" in data:
+            data["comparison_table_md"] = _unescape_field(data.get("comparison_table_md"))
+
         try:
             ans = RegulAIteAnswer(**data)
         except ValidationError:
-            md = data.get("raw_markdown") or ""
-            ans = RegulAIteAnswer(raw_markdown=md.strip() if md else "")
+            md = (data.get("raw_markdown") or "") if isinstance(data, dict) else ""
+            ans = RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
     else:
         md = _strip_code_fences(text).strip()
-        ans = RegulAIteAnswer(raw_markdown=md if md else "")
+        ans = RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
 
-    if not (ans.raw_markdown or "").strip():
+    if not (ans.raw_markdown or "").strip() and not (getattr(ans, "summary", "") or "").strip():
         return DEFAULT_EMPTY
 
     # Ensure follow-ups present
-    if not ans.follow_up_suggestions:
+    if not getattr(ans, "follow_up_suggestions", None):
         topic = (query or "this topic").strip()
         ans.follow_up_suggestions = [
             f"What are approval thresholds and board oversight for {topic}?",
@@ -167,10 +184,12 @@ def ask(
             f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
         ]
 
-    # Soft-ensure the “Recommendation / Workflow / Reporting matrix” appear
-    if "Approval Workflow" not in ans.raw_markdown and "Reporting Matrix" not in ans.raw_markdown:
-        ans.raw_markdown += (
-            "\n\n### Approval Workflow\n"
+    # Soft-ensure the “Recommendation / Workflow / Reporting matrix” appear if missing
+    raw_md = getattr(ans, "raw_markdown", "") or ""
+    if "Approval Workflow" not in raw_md and "Reporting Matrix" not in raw_md:
+        ans.raw_markdown = (
+            f"{raw_md.rstrip()}\n\n"
+            "### Approval Workflow\n"
             "Credit → Risk → Shari’ah Supervisory Board (if applicable) → Board → CBB notification\n"
             "\n### Reporting Matrix\n"
             "| Owner | Item | Frequency |\n"
