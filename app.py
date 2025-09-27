@@ -13,15 +13,47 @@ DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
+# --------- Login users ---------
+AUTH_USERS = {
+    "amit": "Khaleeji#2025",
+    "raj": "RegulAIte#Dev",
+    "review": "POC#Access",
+}
+
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
+
+# -------- Auth state --------
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
+
+def auth_ui():
+    st.markdown("## Sign in")
+    with st.form("login_form"):
+        u = st.text_input("Username", value=st.session_state.user_id or "")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Sign in")
+        if ok:
+            if u in AUTH_USERS and p == AUTH_USERS[u]:
+                st.session_state.auth_ok = True
+                st.session_state.user_id = u
+                st.success("Signed in")
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+if not st.session_state.auth_ok:
+    auth_ui()
+    st.stop()
+
+USER = st.session_state.user_id
 
 # -------- State --------
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.history = load_chat(USER)
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = None  # RegulAIteAnswer
-
-USER = "pilot_user"  # always single user for pilot
 
 # -------- Sidebar --------
 with st.sidebar:
@@ -35,20 +67,18 @@ with st.sidebar:
             st.rerun()
     with colB:
         if st.button("Sign out"):
-            st.session_state.history = []
-            st.session_state.last_answer = None
+            st.session_state.auth_ok = False
+            st.session_state.user_id = ""
             st.rerun()
 
     st.markdown("---")
     st.header("Status")
-    if VECTOR_STORE_ID:
-        st.success("Vector store: connected")
-    else:
-        st.info("Vector store: not connected")
+    st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
     st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
 # -------- Main --------
 st.markdown(f"## {APP_NAME}")
+
 query = st.text_input("Ask a question", placeholder="e.g., Connected counterparties completion/closure controls…")
 cols = st.columns([1, 6])
 with cols[0]:
@@ -76,14 +106,13 @@ def render_followups(default_topic: str | None = None):
             f"What stress-test scenarios are relevant for {topic} and how to calibrate them?",
             f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
         ]
-
     st.caption("Try a follow-up:")
     chip_cols = st.columns(3)
     for i, s in enumerate(suggs[:6]):
         with chip_cols[i % 3]:
             if st.button(
                 s,
-                key=f"chip_{len(st.session_state.history)}_{i}",  # unique key per turn
+                key=f"chip_{len(st.session_state.history)}_{i}",  # unique per turn
                 use_container_width=True,
             ):
                 st.session_state["__chip_query"] = s
@@ -102,15 +131,15 @@ def run_query(q: str):
             q,
             user_id=USER,
             history=st.session_state.history,
-            k_hint=12,  # always max retrieval
+            k_hint=12,
             evidence_mode=True,
-            mode_hint="long",  # always long, chatgpt style
-            web_enabled=True,  # always web + vector
+            mode_hint="long",
+            web_enabled=True,
             vec_id=VECTOR_STORE_ID or None,
             model=DEFAULT_MODEL,
         )
 
-    md = ans.as_markdown().strip() or "_No answer produced._"
+    md = ans.as_markdown().strip() or "_Answer failed._"
     append_turn(USER, "assistant", md)
     st.session_state.history.append({"role": "assistant", "content": md})
     st.session_state.last_answer = ans
@@ -118,7 +147,6 @@ def run_query(q: str):
 
     st.chat_message("assistant").write(md)
 
-# Handle button + chip-triggered queries
 if ask_clicked and query:
     run_query(query)
 
