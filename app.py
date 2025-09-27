@@ -19,15 +19,19 @@ PRESET_USERS = {
     "guest3": "pass3",
 }
 
-# --- Session state ---
+st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
+
+# -------- Session state --------
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
+if "history" not in st.session_state:
+    st.session_state.history: list[dict] = []
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer: RegulAIteAnswer | None = None
 
-st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
-
-# --- Login UI ---
+# -------- Login UI --------
 def auth_ui():
     st.markdown("## 🔐 RegulAIte Login")
     with st.form("login_form"):
@@ -49,7 +53,7 @@ if not st.session_state.auth_ok:
 
 USER = st.session_state.user_id
 
-# --- Sidebar ---
+# -------- Sidebar --------
 with st.sidebar:
     st.header("Session")
     colA, colB = st.columns(2)
@@ -66,85 +70,91 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Status")
-    if VECTOR_STORE_ID:
-        st.success("Vector store: connected")
-    else:
-        st.warning("Vector store: not connected")
+    st.success("Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected")
     st.success("LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing")
 
-# --- State ---
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = None
-
-# --- Main UI ---
+# -------- Main --------
 st.markdown(f"## {APP_NAME}")
-query = st.text_input("Ask a question", placeholder="e.g., CBB disclosure requirements for large exposures…")
+
+query = st.text_input(
+    "Ask a question",
+    placeholder="e.g., According to the CBB Rulebook, what are disclosure requirements for large exposures (compare with Basel)?",
+)
 
 if st.button("Ask", type="primary", use_container_width=True) and query.strip():
     st.session_state.history.append({"role": "user", "content": query})
     with st.spinner("Thinking…"):
-        ans = ask(
-            query,
+        ans: RegulAIteAnswer = ask(
+            query=query,
             user_id=USER,
             history=st.session_state.history,
-            mode="long",
+            # hard-tuned for long, high-quality answers:
             k_hint=12,
             evidence_mode=True,
+            mode_hint="long",
             web_enabled=True,
+            vec_id=VECTOR_STORE_ID or None,
             model=DEFAULT_MODEL,
         )
     st.session_state.last_answer = ans
     md = ans.as_markdown().strip() or "_No answer produced._"
     st.session_state.history.append({"role": "assistant", "content": md})
+    st.rerun()
 
-# --- Render history ---
+# Render history
 for turn in st.session_state.history:
     if turn["role"] == "user":
         st.chat_message("user").write(turn["content"])
     else:
         st.chat_message("assistant").write(turn["content"])
 
-# --- Follow-up chips ---
+# Follow-ups (always)
 def render_followups():
-    suggs = []
+    suggs: list[str] = []
     if isinstance(st.session_state.last_answer, RegulAIteAnswer):
         suggs = st.session_state.last_answer.follow_up_suggestions or []
-    if not suggs and query:
+    if not suggs:
+        topic = (query or "the topic").strip()
         suggs = [
-            f"What are approval thresholds and board oversight for {query}?",
-            f"Draft a closure checklist for {query} with controls and required evidence.",
-            f"What reporting pack fields should be in the monthly board pack for {query}?",
-            f"How should breaches/exceptions for {query} be escalated and documented?",
-            f"What stress-test scenarios are relevant for {query} and how to calibrate them?",
-            f"What are the key risks, controls, and KRIs for {query} (with metrics)?",
+            f"What are approval thresholds and board oversight for {topic}?",
+            f"Draft a closure checklist for {topic} with controls and required evidence.",
+            f"What reporting pack fields should be in the monthly board pack for {topic}?",
+            f"How should breaches/exceptions for {topic} be escalated and documented?",
+            f"What stress-test scenarios are relevant for {topic} and how to calibrate them?",
+            f"What are the key risks, controls, and KRIs for {topic} (with metrics)?",
         ]
     if suggs:
         st.caption("Try a follow-up:")
         chip_cols = st.columns(3)
         for i, s in enumerate(suggs[:6]):
             with chip_cols[i % 3]:
-                if st.button(s, key=f"chip_{i}", use_container_width=True):
+                if st.button(
+                    s,
+                    key=f"chip_{len(st.session_state.history)}_{i}",  # unique per render
+                    use_container_width=True,
+                ):
                     st.session_state["__chip_query"] = s
+                    st.rerun()
 
 render_followups()
 
-if "__chip_query" in st.session_state:
-    chip_q = st.session_state.pop("__chip_query")
+# Handle follow-up chip
+chip_q = st.session_state.pop("__chip_query", None)
+if chip_q:
     st.session_state.history.append({"role": "user", "content": chip_q})
     with st.spinner("Thinking…"):
-        ans = ask(
-            chip_q,
+        ans: RegulAIteAnswer = ask(
+            query=chip_q,
             user_id=USER,
             history=st.session_state.history,
-            mode="long",
             k_hint=12,
             evidence_mode=True,
+            mode_hint="long",
             web_enabled=True,
+            vec_id=VECTOR_STORE_ID or None,
             model=DEFAULT_MODEL,
         )
     st.session_state.last_answer = ans
     md = ans.as_markdown().strip() or "_No answer produced._"
     st.session_state.history.append({"role": "assistant", "content": md})
-    st.chat_message("assistant").write(md)
+    st.rerun()
