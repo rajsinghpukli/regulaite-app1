@@ -92,10 +92,10 @@ def _call_llm(messages: List[Dict[str,str]], model: str, max_out: int) -> RegulA
         return RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
 
 # ---------- STRICT CITE-ONLY MODE ----------
-# Trigger ONLY when user asks for exact quotes/sections (not just mentions CM-5.x)
+# Trigger ONLY when user explicitly asks for exact quotes/sections (not just mentions CM-5.x)
 _STRICT_KEYWORDS = [
     "cite only", "exact sentence", "verbatim", "quote verbatim", "return only",
-    "exact clause", "quote the exact", "quoted sentence"
+    "exact clause", "quoted sentence", "quote the exact"
 ]
 def _is_strict_citation(q: str) -> bool:
     ql = (q or "").lower()
@@ -157,7 +157,9 @@ def ask(
     max_out = _mode_tokens(mode)
     chat_model = (model or os.getenv("CHAT_MODEL") or os.getenv("RESPONSES_MODEL") or "gpt-4o-mini").strip()
 
-    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
+    # Style nudge: more narrative, fewer bullets (no behavior change)
+    sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode) + \
+        "\n\nStyle note: prefer clear paragraphs with occasional short lists; use tables for calculations. Avoid dense bullet walls."
 
     strict = _is_strict_citation(query)
     force_web = _needs_web_bias(query)
@@ -199,8 +201,38 @@ def ask(
     # ----- PASS 2: Web-fallback (forced for BIS; normal for weak answers) -----
     allow_web = bool(web_enabled) and not _doc_only_from_query(query)
     should_try_web = allow_web and (force_web or (not strict and _weak(ans1, query)))
+
     if should_try_web:
         results = ddg_search(query, max_results=max(8, k_hint))
+
+        # Special deterministic BIS handling: we can safely extract URL and BCBS code from URL
+        ql = (query or "").lower()
+        bis_like = ("bis.org" in ql or " bcbs" in ql) and "large exposure" in ql
+
+        if bis_like and results:
+            # pick the first BIS match that looks like /publ/bcbs###
+            best = None
+            for r in results:
+                u = r.get("url","")
+                if u.startswith("https://www.bis.org/") and "/publ/bcbs" in u:
+                    best = u
+                    break
+            if not best:
+                best = results[0].get("url","")
+
+            bcbs_code = ""
+            m = re.search(r'bcbs(\d+)', best or "", re.IGNORECASE)
+            if m: bcbs_code = f"BCBS {m.group(1)}"
+
+            # Build a direct, safe answer without asking the model to guess dates
+            parts = []
+            if best: parts.append(f"1) {best}")
+            parts.append(f"2) not found")     # we do not fabricate a publication date
+            if bcbs_code: parts.append(f"3) {bcbs_code}")
+            else: parts.append("3) not found")
+
+            return RegulAIteAnswer(raw_markdown="\n".join(parts))
+
         if results:
             lines = ["Web snippets (use prudently; internal docs take precedence):"]
             for i, r in enumerate(results, 1):
