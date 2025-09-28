@@ -8,7 +8,7 @@ def ddg_search(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
     - Pass 1: generic
     - Pass 2: if query hints BIS, try site:bis.org
     - Fallback: if asking for the known 'large exposures' BIS paper, return its URL
-    Returns [] on any unexpected error.
+    Returns [] on any unexpected error (never crashes caller).
     """
     def _search(q: str, n: int) -> List[Dict[str, Any]]:
         try:
