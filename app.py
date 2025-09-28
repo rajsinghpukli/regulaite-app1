@@ -15,7 +15,6 @@ DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
-# Preset logins (unchanged)
 PRESET_USERS = {"guest1": "pass1", "guest2": "pass2", "guest3": "pass3"}
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
@@ -41,13 +40,12 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ---- session (unchanged) ----
+# session
 if "auth_ok" not in st.session_state: st.session_state.auth_ok = False
 if "user_id" not in st.session_state: st.session_state.user_id = ""
 if "history" not in st.session_state: st.session_state.history: List[Dict[str,str]] = []
 if "last_answer" not in st.session_state: st.session_state.last_answer: RegulAIteAnswer|None = None
 
-# ---- helpers (rendering only; no behavior changes) ----
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -78,7 +76,7 @@ def render_message(role: str, md: str, meta: str = ""):
 def _ts() -> str:
     return time.strftime("%H:%M")
 
-# ---- login (unchanged) ----
+# login
 def auth_ui():
     st.markdown("## 🔐 RegulAIte Login")
     with st.form("login_form"):
@@ -99,7 +97,7 @@ if not st.session_state.auth_ok:
 
 USER = st.session_state.user_id
 
-# ---- sidebar (unchanged) ----
+# sidebar
 with st.sidebar:
     st.header("Session")
     c1, c2 = st.columns(2)
@@ -115,10 +113,9 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# ---- main header (unchanged) ----
+# main header
 st.markdown(f"## {APP_NAME}")
 
-# Keep your top input for the first question (unchanged)
 first_q = st.text_input(
     "Ask a question",
     placeholder="e.g., CBB disclosure requirements for large exposures (compare with Basel)?",
@@ -126,7 +123,6 @@ first_q = st.text_input(
 
 def run_query(q: str):
     if not q.strip(): return
-    # prevent accidental duplicates
     if st.session_state.history and st.session_state.history[-1]["role"] == "user" \
        and st.session_state.history[-1]["content"].strip() == q.strip():
         return
@@ -144,7 +140,7 @@ def run_query(q: str):
                 k_hint=12,
                 evidence_mode=True,
                 mode_hint="long",
-                web_enabled=True,                 # web used only when needed; never crashes
+                web_enabled=True,
                 vec_id=VECTOR_STORE_ID or None,
                 model=DEFAULT_MODEL,
             )
@@ -152,28 +148,27 @@ def run_query(q: str):
             ans = RegulAIteAnswer(raw_markdown=f"### Error\nCould not complete the request.\n\nDetails: {e}")
 
     md = _coerce_answer_to_markdown(ans)
-    meta = "Signals: vector ✅" + (" | web ✅" if getattr(ans, "used_web", False) else " | web ❌")
+    # No more access to a non-schema flag; safe meta
+    meta = "Signals: vector ✅"
     append_turn(USER, "assistant", md)
     st.session_state.history.append({"role": "assistant", "content": md, "meta": meta})
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
-# First “Ask” button (unchanged)
 cbtn, _ = st.columns([1,6])
 with cbtn:
     if st.button("Ask", type="primary", use_container_width=True) and first_q:
         run_query(first_q)
 
-# Render chat (unchanged logic; clearer meta)
 for turn in st.session_state.history:
     render_message(turn["role"], _unescape(_strip_code_fences(turn["content"])), turn.get("meta",""))
 
-# Sticky bottom composer so you can continue the chat (added; non-breaking)
+# sticky composer for follow-ups
 follow_q = st.chat_input("Type a follow-up…")
 if follow_q:
     run_query(follow_q)
 
-# Short follow-up chips (labels only; unchanged behavior)
+# quick follow-up chips
 def render_followups():
     suggs = [
         "Board approval thresholds for large exposures",
