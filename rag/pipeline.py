@@ -65,7 +65,6 @@ def _weak(ans: RegulAIteAnswer, query: str) -> bool:
     return too_short or says_not_found or no_evidence
 
 def _doc_only_from_query(q: str) -> bool:
-    # Light heuristic: if user demands one source / "cite only", we avoid web.
     ql = q.lower()
     return ("cite only" in ql) or ("cbb rulebook" in ql and "bis" not in ql and "basel" not in ql and "web" not in ql)
 
@@ -117,7 +116,7 @@ def ask(
         "do NOT escape them as \\n. No prose outside JSON."
     )
 
-    # ----- PASS 1: Vector-first (unchanged from your baseline) -----
+    # PASS 1: vector-only
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
@@ -131,10 +130,9 @@ def ask(
     except Exception as e:
         return RegulAIteAnswer(raw_markdown=f"### Error\nModel call failed.\n\nDetails: {e}")
 
-    used_web = False
     ans = ans1
 
-    # ----- PASS 2: Web-fallback only if weak AND not doc-only -----
+    # PASS 2: web fallback only if weak and not doc-only
     allow_web = bool(web_enabled) and not _doc_only_from_query(query)
     if allow_web and _weak(ans1, query):
         try:
@@ -159,7 +157,6 @@ def ask(
             ans2 = _call_llm(messages2, chat_model, max_out)
             if (ans2.raw_markdown or "").strip():
                 ans = ans2
-                used_web = True
 
     if not (ans.raw_markdown or "").strip() and not (getattr(ans, "summary", "") or "").strip():
         return DEFAULT_EMPTY
@@ -188,5 +185,4 @@ def ask(
             "| Board | Connected exposure approvals | Ongoing |\n"
         )
 
-    setattr(ans, "used_web", used_web)
     return ans
