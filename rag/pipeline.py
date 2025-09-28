@@ -87,6 +87,54 @@ def _call_llm(messages: List[Dict[str,str]], model: str, max_out: int) -> RegulA
         md = _strip_code_fences(text).strip()
         return RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
 
+# ---------- STRICT CITE-ONLY MODE ----------
+# Auto-trigger when queries demand exact quotes/sections
+_STRICT_KEYWORDS = [
+    "cite only", "exact sentence", "verbatim", "quote verbatim",
+    "cm-5.", "ifrs 7", "ifrs 9", "fas 30", "fas 33", "§"
+]
+
+def _is_strict_citation(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(k in ql for k in _STRICT_KEYWORDS)
+
+# Minimal post-processor to enforce quotes+refs-only when strict mode is on
+_QUOTE_RE = re.compile(r'"[^"\n]{5,}"')             # at least some quoted text
+_REF_RE   = re.compile(r'\b(CM-\d+\.\d+(?:\.\d+)?|IFRS\s*\d+(?:\.\d+)?(?:[\s\.,-]\d+\w*)?|IFRS\s*7\.\d+\w*|FAS\s*\d+\s*§\s*[\w\.-]+)\b', re.IGNORECASE)
+
+def _reduce_to_quotes_only(ans: RegulAIteAnswer) -> RegulAIteAnswer:
+    """
+    Keep only literal quotes + references in raw_markdown.
+    If none found, return 'not found'.
+    """
+    body = (ans.raw_markdown or "").strip()
+    lines = []
+    # collect pairs within the text
+    quotes = _QUOTE_RE.findall(body)
+    refs   = _REF_RE.findall(body)
+
+    # naive pairing: interleave quotes and refs in order of appearance
+    # (good enough to suppress hallucinated prose)
+    if quotes and refs:
+        # keep up to the min count to avoid mismatched lists
+        n = min(len(quotes), len(refs))
+        for i in range(n):
+            q = quotes[i].strip()
+            r = refs[i].strip()
+            lines.append(f'{q}  \n— {r}')
+    elif quotes:
+        for q in quotes:
+            lines.append(f'{q}')
+    elif refs:
+        for r in refs:
+            lines.append(f'— {r}')
+
+    if not lines:
+        return RegulAIteAnswer(raw_markdown="not found")
+
+    reduced = "\n\n".join(lines)
+    return RegulAIteAnswer(raw_markdown=reduced)
+
 # ---------- main ----------
 def ask(
     query: str,
@@ -108,15 +156,28 @@ def ask(
 
     sys_inst = build_system_instruction(k_hint=k_hint, evidence_mode=evidence_mode, mode=mode)
 
-    schema_msg = (
-        "Return ONE JSON object ONLY with keys: "
-        "raw_markdown (string), summary (string), per_source (object), "
-        "comparison_table_md (string, optional), follow_up_suggestions (array of strings). "
-        "IMPORTANT: Use REAL newlines in raw_markdown and comparison_table_md; "
-        "do NOT escape them as \\n. No prose outside JSON."
-    )
+    # Detect strict cite-only intent
+    strict = _is_strict_citation(query)
 
-    # PASS 1: vector-only
+    if strict:
+        # Overwrite schema to force only quotes/refs (or 'not found')
+        schema_msg = (
+            "Return ONE JSON object ONLY with key raw_markdown (string). "
+            "In raw_markdown return ONLY literal quoted sentence(s) and precise reference(s) "
+            "(e.g., \"…\" — CM-5.2.x / IFRS 7.35F / FAS 33 §4.2). "
+            "If exact quote in the requested chapter/standard is not found, return exactly: not found. "
+            "No summaries, no explanations, no extra text outside JSON."
+        )
+    else:
+        schema_msg = (
+            "Return ONE JSON object ONLY with keys: "
+            "raw_markdown (string), summary (string), per_source (object), "
+            "comparison_table_md (string, optional), follow_up_suggestions (array of strings). "
+            "IMPORTANT: Use REAL newlines in raw_markdown and comparison_table_md; "
+            "do NOT escape them as \\n. No prose outside JSON."
+        )
+
+    # ----- PASS 1: Vector-first -----
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
@@ -132,9 +193,9 @@ def ask(
 
     ans = ans1
 
-    # PASS 2: web fallback only if weak and not doc-only
+    # ----- PASS 2: Web-fallback only if weak AND not doc-only -----
     allow_web = bool(web_enabled) and not _doc_only_from_query(query)
-    if allow_web and _weak(ans1, query):
+    if allow_web and not strict and _weak(ans1, query):
         try:
             results = ddg_search(query, max_results=max(8, k_hint))
         except Exception:
@@ -158,10 +219,17 @@ def ask(
             if (ans2.raw_markdown or "").strip():
                 ans = ans2
 
+    # ----- STRICT POST-PROCESSING -----
+    if strict:
+        # Keep only quotes + references; if nothing valid, return 'not found'
+        ans = _reduce_to_quotes_only(ans)
+
+    # ----- Safety net -----
     if not (ans.raw_markdown or "").strip() and not (getattr(ans, "summary", "") or "").strip():
         return DEFAULT_EMPTY
 
-    if not getattr(ans, "follow_up_suggestions", None):
+    # Follow-ups (only in non-strict mode)
+    if not strict and not getattr(ans, "follow_up_suggestions", None):
         ans.follow_up_suggestions = [
             "Board approval thresholds for large exposures",
             "Monthly reporting checklist for large exposures",
@@ -171,18 +239,20 @@ def ask(
             "Differences CBB vs Basel: connected parties",
         ]
 
-    raw_md = getattr(ans, "raw_markdown", "") or ""
-    if "Approval Workflow" not in raw_md and "Reporting Matrix" not in raw_md:
-        ans.raw_markdown = (
-            f"{raw_md.rstrip()}\n\n"
-            "### Approval Workflow\n"
-            "Credit → Risk → Shari’ah Supervisory Board (if applicable) → Board → CBB notification\n"
-            "\n### Reporting Matrix\n"
-            "| Owner | Item | Frequency |\n"
-            "|---|---|---|\n"
-            "| Risk | Large exposure register | Monthly |\n"
-            "| Compliance | CBB submissions | Quarterly |\n"
-            "| Board | Connected exposure approvals | Ongoing |\n"
-        )
+    # Append helper sections only in non-strict mode
+    if not strict:
+        raw_md = getattr(ans, "raw_markdown", "") or ""
+        if "Approval Workflow" not in raw_md and "Reporting Matrix" not in raw_md:
+            ans.raw_markdown = (
+                f"{raw_md.rstrip()}\n\n"
+                "### Approval Workflow\n"
+                "Credit → Risk → Shari’ah Supervisory Board (if applicable) → Board → CBB notification\n"
+                "\n### Reporting Matrix\n"
+                "| Owner | Item | Frequency |\n"
+                "|---|---|---|\n"
+                "| Risk | Large exposure register | Monthly |\n"
+                "| Compliance | CBB submissions | Quarterly |\n"
+                "| Board | Connected exposure approvals | Ongoing |\n"
+            )
 
     return ans
