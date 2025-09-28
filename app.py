@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, re, time
+import os, re, time, json
 from typing import Any, Dict, List
 import streamlit as st
 from dotenv import load_dotenv
@@ -40,12 +40,13 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# session
+# ---- session
 if "auth_ok" not in st.session_state: st.session_state.auth_ok = False
 if "user_id" not in st.session_state: st.session_state.user_id = ""
 if "history" not in st.session_state: st.session_state.history: List[Dict[str,str]] = []
 if "last_answer" not in st.session_state: st.session_state.last_answer: RegulAIteAnswer|None = None
 
+# ---- rendering helpers (display-only; safe)
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -53,17 +54,91 @@ def _strip_code_fences(s: str) -> str:
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
-def _unescape(text: str) -> str:
+def _unescape_newlines(text: str) -> str:
+    # Convert visible \n to actual newlines if needed
     return text.replace("\\n", "\n") if "\\n" in text and "\n" not in text else text
 
+def _find_json_blob(s: str) -> Dict[str, Any] | None:
+    """Find { ... } in a string and parse to dict if possible."""
+    s = _strip_code_fences(s)
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not m:
+        return None
+    raw = m.group(0)
+    try:
+        return json.loads(raw)
+    except Exception:
+        # Tolerate trailing commas
+        raw2 = re.sub(r",\s*}", "}", raw)
+        raw2 = re.sub(r",\s*]", "]", raw2)
+        try:
+            return json.loads(raw2)
+        except Exception:
+            # Try to salvage raw_markdown specifically
+            m2 = re.search(r'"raw_markdown"\s*:\s*"(.*)"\s*(,|\})', raw, flags=re.DOTALL)
+            if m2:
+                val = m2.group(1)
+                val = val.replace(r"\\n", "\n").replace(r"\\t", "\t").replace(r"\\\"", "\"")
+                return {"raw_markdown": val}
+            return None
+
+def _format_per_source(per_source: Dict[str, Any]) -> str:
+    if not isinstance(per_source, dict) or not per_source:
+        return ""
+    lines = ["## Evidence by Framework"]
+    for fw, quotes in per_source.items():
+        lines.append(f"**{fw}**")
+        if isinstance(quotes, list):
+            for q in quotes:
+                q = str(q)
+                lines.append(f"- {_unescape_newlines(q).strip()}")
+    return "\n".join(lines)
+
+def _normalize_to_markdown(text: str) -> str:
+    """
+    Accept:
+      - clean markdown string
+      - markdown with visible \n
+      - a JSON-ish blob containing raw_markdown / summary / comparison_table_md / per_source
+    Return: clean markdown for display.
+    """
+    text = text or ""
+    # 1) If we can parse JSON, format from keys
+    blob = _find_json_blob(text)
+    if isinstance(blob, dict) and blob:
+        parts: List[str] = []
+        # Prefer raw_markdown if present
+        raw_md = blob.get("raw_markdown")
+        if isinstance(raw_md, str) and raw_md.strip():
+            parts.append(_unescape_newlines(_strip_code_fences(raw_md.strip())))
+        else:
+            # Compose from pieces
+            summary = blob.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                parts.append("## Summary")
+                parts.append(_unescape_newlines(summary.strip()))
+            cmp_md = blob.get("comparison_table_md")
+            if isinstance(cmp_md, str) and cmp_md.strip():
+                parts.append("## Comparison")
+                parts.append(_unescape_newlines(_strip_code_fences(cmp_md.strip())))
+            ps = blob.get("per_source") or {}
+            ps_md = _format_per_source(ps) if isinstance(ps, dict) else ""
+            if ps_md:
+                parts.append(ps_md)
+        if parts:
+            return "\n\n".join(parts).strip()
+
+    # 2) Not JSON → fix visible \n then show
+    return _unescape_newlines(_strip_code_fences(text)).strip()
+
 def _coerce_answer_to_markdown(ans: RegulAIteAnswer) -> str:
+    """Use your model’s as_markdown(), but normalize if it’s messy."""
     try:
         md = ans.as_markdown() or ""
     except Exception:
         md = ""
-    md = _strip_code_fences(md)
-    md = _unescape(md)
-    return md.strip() or "_No answer produced._"
+    md = _normalize_to_markdown(md)
+    return md if md else "_No answer produced._"
 
 def render_message(role: str, md: str, meta: str = ""):
     kind = "regu-user" if role == "user" else "regu-assistant"
@@ -76,7 +151,7 @@ def render_message(role: str, md: str, meta: str = ""):
 def _ts() -> str:
     return time.strftime("%H:%M")
 
-# login
+# ---- login (unchanged)
 def auth_ui():
     st.markdown("## 🔐 RegulAIte Login")
     with st.form("login_form"):
@@ -97,14 +172,21 @@ if not st.session_state.auth_ok:
 
 USER = st.session_state.user_id
 
-# sidebar
+# ---- sidebar (unchanged)
 with st.sidebar:
     st.header("Session")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Clear chat"): clear_chat(USER); st.session_state.history=[]; st.session_state.last_answer=None; st.rerun()
+        if st.button("Clear chat"):
+            clear_chat(USER)
+            st.session_state.history=[]
+            st.session_state.last_answer=None
+            st.rerun()
     with c2:
-        if st.button("Sign out"): st.session_state.auth_ok=False; st.session_state.user_id=""; st.rerun()
+        if st.button("Sign out"):
+            st.session_state.auth_ok=False
+            st.session_state.user_id=""
+            st.rerun()
     st.markdown("---")
     st.header("Status")
     st.markdown(
@@ -113,7 +195,7 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# main header
+# ---- main header (unchanged baseline)
 st.markdown(f"## {APP_NAME}")
 
 first_q = st.text_input(
@@ -123,6 +205,7 @@ first_q = st.text_input(
 
 def run_query(q: str):
     if not q.strip(): return
+    # Avoid accidental double-submit of same question
     if st.session_state.history and st.session_state.history[-1]["role"] == "user" \
        and st.session_state.history[-1]["content"].strip() == q.strip():
         return
@@ -148,27 +231,28 @@ def run_query(q: str):
             ans = RegulAIteAnswer(raw_markdown=f"### Error\nCould not complete the request.\n\nDetails: {e}")
 
     md = _coerce_answer_to_markdown(ans)
-    # No more access to a non-schema flag; safe meta
-    meta = "Signals: vector ✅"
     append_turn(USER, "assistant", md)
-    st.session_state.history.append({"role": "assistant", "content": md, "meta": meta})
+    st.session_state.history.append({"role": "assistant", "content": md, "meta": " "})
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
+# First Ask button (unchanged)
 cbtn, _ = st.columns([1,6])
 with cbtn:
     if st.button("Ask", type="primary", use_container_width=True) and first_q:
         run_query(first_q)
 
+# Render chat (now normalized for both old/new content)
 for turn in st.session_state.history:
-    render_message(turn["role"], _unescape(_strip_code_fences(turn["content"])), turn.get("meta",""))
+    clean = _normalize_to_markdown(turn["content"])
+    render_message(turn["role"], clean, turn.get("meta",""))
 
-# sticky composer for follow-ups
+# Sticky bottom composer (unchanged addition)
 follow_q = st.chat_input("Type a follow-up…")
 if follow_q:
     run_query(follow_q)
 
-# quick follow-up chips
+# Simple follow-up chips (unchanged)
 def render_followups():
     suggs = [
         "Board approval thresholds for large exposures",
