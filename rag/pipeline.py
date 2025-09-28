@@ -70,8 +70,7 @@ def _doc_only_from_query(q: str) -> bool:
 
 def _needs_web_bias(q: str) -> bool:
     ql = (q or "").lower()
-    # Force a web pass for BIS/bis.org style questions (metadata/URL)
-    return ("bis.org" in ql) or (" bcbs" in ql) or ("bis " in ql and "url" in ql)
+    return ("bis.org" in ql) or (" bcbs" in ql) or ("bis " in ql and "url" in ql) or ("publication date" in ql)
 
 def _call_llm(messages: List[Dict[str,str]], model: str, max_out: int) -> RegulAIteAnswer:
     resp = client.chat.completions.create(
@@ -93,15 +92,16 @@ def _call_llm(messages: List[Dict[str,str]], model: str, max_out: int) -> RegulA
         return RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
 
 # ---------- STRICT CITE-ONLY MODE ----------
+# Trigger ONLY when user asks for exact quotes/sections (not just mentions CM-5.x)
 _STRICT_KEYWORDS = [
     "cite only", "exact sentence", "verbatim", "quote verbatim", "return only",
-    "cm-5.", "ifrs 7", "ifrs 9", "fas 30", "fas 33", "§"
+    "exact clause", "quote the exact", "quoted sentence"
 ]
 def _is_strict_citation(q: str) -> bool:
     ql = (q or "").lower()
     return any(k in ql for k in _STRICT_KEYWORDS)
 
-# Regex to harvest literal quotes and references
+# Harvest literal quotes + references
 _QUOTE_RE = re.compile(r'"[^"\n]{5,}"')  # some quoted text
 _REF_RE   = re.compile(
     r'\b('
@@ -116,8 +116,8 @@ _REF_RE   = re.compile(
 def _reduce_to_quotes_only(ans: RegulAIteAnswer) -> RegulAIteAnswer:
     """
     Keep only literal quotes + references in raw_markdown.
-    If no quotes are found, return 'not found' (never emit refs-only junk).
-    If quotes exist but no clear refs, return just the quotes.
+    - If no quotes, return 'not found' (never emit refs-only junk).
+    - If quotes but no refs, return quotes alone.
     """
     body = (ans.raw_markdown or "").strip()
     quotes = _QUOTE_RE.findall(body)
@@ -127,18 +127,16 @@ def _reduce_to_quotes_only(ans: RegulAIteAnswer) -> RegulAIteAnswer:
 
     lines: List[str] = []
     if refs:
-        # naive pairing: interleave up to min length
         n = min(len(quotes), len(refs))
         for i in range(n):
             lines.append(f'{quotes[i].strip()}  \n— {refs[i].strip()}')
-        # if more quotes than refs, keep the remaining quotes
         for q in quotes[n:]:
             lines.append(q.strip())
     else:
         for q in quotes:
             lines.append(q.strip())
 
-    return RegulAIteAnswer(raw_markdown="\n\n".join(lines))
+    return RegulAIteAnswer(raw_markdown="\n".join(lines))
 
 # ---------- main ----------
 def ask(
@@ -164,6 +162,7 @@ def ask(
     strict = _is_strict_citation(query)
     force_web = _needs_web_bias(query)
 
+    # Schema for LLM
     if strict:
         schema_msg = (
             "Return ONE JSON object ONLY with key raw_markdown (string). "
@@ -197,9 +196,9 @@ def ask(
 
     ans = ans1
 
-    # ----- PASS 2: Web-fallback (or forced for BIS) -----
+    # ----- PASS 2: Web-fallback (forced for BIS; normal for weak answers) -----
     allow_web = bool(web_enabled) and not _doc_only_from_query(query)
-    should_try_web = (allow_web and not strict and (_weak(ans1, query) or force_web))
+    should_try_web = allow_web and (force_web or (not strict and _weak(ans1, query)))
     if should_try_web:
         results = ddg_search(query, max_results=max(8, k_hint))
         if results:
@@ -230,15 +229,9 @@ def ask(
         return DEFAULT_EMPTY
 
     # ----- Helper sections: only for normal, longer narratives -----
-    q_l = (query or "").lower()
-    is_citation_like = any(k in q_l for k in [
-        "cite only", "exact sentence", "verbatim", "quote", "return only",
-        "cm-5.", "ifrs 7", "ifrs 9", "fas 30", "fas 33", "§"
-    ])
     raw_md = getattr(ans, "raw_markdown", "") or ""
     is_long_narrative = len(raw_md) >= 500
-
-    if (not strict) and (not is_citation_like) and is_long_narrative:
+    if (not strict) and is_long_narrative:
         if "Approval Workflow" not in raw_md and "Reporting Matrix" not in raw_md:
             ans.raw_markdown = (
                 f"{raw_md.rstrip()}\n\n"
