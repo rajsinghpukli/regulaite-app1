@@ -88,52 +88,47 @@ def _call_llm(messages: List[Dict[str,str]], model: str, max_out: int) -> RegulA
         return RegulAIteAnswer(raw_markdown=_unescape_field(md) or "")
 
 # ---------- STRICT CITE-ONLY MODE ----------
-# Auto-trigger when queries demand exact quotes/sections
+# Triggers when query clearly asks for exact clauses/sections/quotes
 _STRICT_KEYWORDS = [
-    "cite only", "exact sentence", "verbatim", "quote verbatim",
+    "cite only", "exact sentence", "verbatim", "quote verbatim", "return only",
     "cm-5.", "ifrs 7", "ifrs 9", "fas 30", "fas 33", "§"
 ]
-
 def _is_strict_citation(q: str) -> bool:
     ql = (q or "").lower()
     return any(k in ql for k in _STRICT_KEYWORDS)
 
-# Minimal post-processor to enforce quotes+refs-only when strict mode is on
-_QUOTE_RE = re.compile(r'"[^"\n]{5,}"')             # at least some quoted text
-_REF_RE   = re.compile(r'\b(CM-\d+\.\d+(?:\.\d+)?|IFRS\s*\d+(?:\.\d+)?(?:[\s\.,-]\d+\w*)?|IFRS\s*7\.\d+\w*|FAS\s*\d+\s*§\s*[\w\.-]+)\b', re.IGNORECASE)
+# Keep only literal quotes + references when strict mode is on
+_QUOTE_RE = re.compile(r'"[^"\n]{5,}"')  # some quoted text
+_REF_RE   = re.compile(
+    r'\b('
+    r'CM-\d+\.\d+(?:\.\d+)?'             # CBB CM-5.2.1 etc.
+    r'|IFRS\s*\d+(?:\.\d+)?(?:\.\d+)?'    # IFRS 9.5.5.1 etc.
+    r'|IFRS\s*7\.\d+\w*'                  # IFRS 7.xx
+    r'|FAS\s*\d+\s*§\s*[\w\.-]+'          # FAS 33 §4.2
+    r')\b',
+    re.IGNORECASE
+)
 
 def _reduce_to_quotes_only(ans: RegulAIteAnswer) -> RegulAIteAnswer:
-    """
-    Keep only literal quotes + references in raw_markdown.
-    If none found, return 'not found'.
-    """
     body = (ans.raw_markdown or "").strip()
-    lines = []
-    # collect pairs within the text
     quotes = _QUOTE_RE.findall(body)
     refs   = _REF_RE.findall(body)
+    lines: List[str] = []
 
-    # naive pairing: interleave quotes and refs in order of appearance
-    # (good enough to suppress hallucinated prose)
     if quotes and refs:
-        # keep up to the min count to avoid mismatched lists
         n = min(len(quotes), len(refs))
         for i in range(n):
             q = quotes[i].strip()
             r = refs[i].strip()
             lines.append(f'{q}  \n— {r}')
     elif quotes:
-        for q in quotes:
-            lines.append(f'{q}')
+        for q in quotes: lines.append(q.strip())
     elif refs:
-        for r in refs:
-            lines.append(f'— {r}')
+        for r in refs: lines.append(f'— {r.strip()}')
 
     if not lines:
         return RegulAIteAnswer(raw_markdown="not found")
-
-    reduced = "\n\n".join(lines)
-    return RegulAIteAnswer(raw_markdown=reduced)
+    return RegulAIteAnswer(raw_markdown="\n\n".join(lines))
 
 # ---------- main ----------
 def ask(
@@ -159,8 +154,8 @@ def ask(
     # Detect strict cite-only intent
     strict = _is_strict_citation(query)
 
+    # Schema for LLM
     if strict:
-        # Overwrite schema to force only quotes/refs (or 'not found')
         schema_msg = (
             "Return ONE JSON object ONLY with key raw_markdown (string). "
             "In raw_markdown return ONLY literal quoted sentence(s) and precise reference(s) "
@@ -193,7 +188,7 @@ def ask(
 
     ans = ans1
 
-    # ----- PASS 2: Web-fallback only if weak AND not doc-only -----
+    # ----- PASS 2: Web-fallback only if weak & not doc-only & not strict -----
     allow_web = bool(web_enabled) and not _doc_only_from_query(query)
     if allow_web and not strict and _weak(ans1, query):
         try:
@@ -221,27 +216,22 @@ def ask(
 
     # ----- STRICT POST-PROCESSING -----
     if strict:
-        # Keep only quotes + references; if nothing valid, return 'not found'
         ans = _reduce_to_quotes_only(ans)
 
     # ----- Safety net -----
     if not (ans.raw_markdown or "").strip() and not (getattr(ans, "summary", "") or "").strip():
         return DEFAULT_EMPTY
 
-    # Follow-ups (only in non-strict mode)
-    if not strict and not getattr(ans, "follow_up_suggestions", None):
-        ans.follow_up_suggestions = [
-            "Board approval thresholds for large exposures",
-            "Monthly reporting checklist for large exposures",
-            "Escalation steps for breaches and exceptions",
-            "Stress-test scenarios for concentration risk",
-            "KRIs and metrics for exposure concentration",
-            "Differences CBB vs Basel: connected parties",
-        ]
+    # ----- Helper sections: add ONLY for normal, longer narrative answers -----
+    q_l = (query or "").lower()
+    is_citation_like = any(k in q_l for k in [
+        "cite only", "exact sentence", "verbatim", "quote", "return only",
+        "cm-5.", "ifrs 7", "ifrs 9", "fas 30", "fas 33", "§"
+    ])
+    raw_md = getattr(ans, "raw_markdown", "") or ""
+    is_long_narrative = len(raw_md) >= 500  # simple length guard
 
-    # Append helper sections only in non-strict mode
-    if not strict:
-        raw_md = getattr(ans, "raw_markdown", "") or ""
+    if (not strict) and (not is_citation_like) and is_long_narrative:
         if "Approval Workflow" not in raw_md and "Reporting Matrix" not in raw_md:
             ans.raw_markdown = (
                 f"{raw_md.rstrip()}\n\n"
