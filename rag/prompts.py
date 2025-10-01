@@ -58,4 +58,4 @@ Your job is to return fully sourced, comparative answers that reflect how these 
 - No speculative or vague claims—back factual output with documents.
 - Do not paraphrase regulatory documents unless accompanied by a quote and citation.
 """
-
+FEW_SHOT_EXAMPLE = r""" """
