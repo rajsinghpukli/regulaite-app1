@@ -17,29 +17,51 @@ LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
 PRESET_USERS = {"guest1": "pass1", "guest2": "pass2", "guest3": "pass3"}
 
+# ---------- Branding ----------
+BRAND_BG = "#EAF3FF"       # Light blue bg
+BRAND_PRIMARY = "#0C5ECD"  # Accent
+BRAND_DARK = "#2A2F36"     # Headings
+LOGO_PATH = "rag/assets/khaleeji_logo.png"
+
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
 # -------------------- Styles (display-only) --------------------
-CSS = """
+CSS = f"""
 <style>
-.block-container { max-width: 1180px; }
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px;border:1px solid #0001}
-.badge.ok{background:#ecfdf5;color:#065f46;border-color:#10b98133}
-.badge.warn{background:#fff7ed;color:#9a3412;border-color:#f59e0b33}
-.badge.err{background:#fef2f2;color:#991b1b;border-color:#ef444433}
-.regu-msg{border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px #0001;border:1px solid #0001;margin-bottom:12px}
-.regu-user{background:#f5f7fb}
-.regu-assistant{background:#ffffff}
-.hdr{font-size:12px;font-weight:600;margin-bottom:6px;opacity:.75}
-.hdr .u{color:#1f2937}
-.hdr .a{color:#0f766e}
-.meta { font-size:12px;color:#6b7280;margin-top:6px }
-.markdown-body { width:100%; word-break: normal; overflow-wrap: break-word; hyphens: auto; }
-.markdown-body h1,.markdown-body h2,.markdown-body h3{margin-top:1.2rem}
-.markdown-body p,.markdown-body li{line-height:1.6}
-.markdown-body table{width:100%;border-collapse:collapse}
-.markdown-body th,.markdown-body td{border:1px solid #e5e7eb;padding:8px;font-size:14px}
-.markdown-body th{background:#f9fafb}
+/* Page background + container width */
+.stApp {{ background:{BRAND_BG}; }}
+.block-container {{ max-width: 1180px; }}
+
+/* Header */
+.kh-header {{ display:flex; align-items:center; gap:12px; padding:8px 0 14px 0; }}
+.kh-title {{ font-size:26px; font-weight:700; color:{BRAND_DARK}; letter-spacing:.2px; }}
+.kh-subtitle {{ color:#5a6473; font-size:13px; margin-top:-4px; }}
+
+/* Sidebar status pills */
+.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;margin-right:6px;border:1px solid #C9E0FF;background:#E7F2FF;color:#164C96}}
+
+/* Chat bubbles */
+.regu-msg{{border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px #0001;border:1px solid #0001;margin-bottom:12px;background:#ffffffcc}}
+.regu-user{{background:#FFFFFF}}
+.regu-assistant{{background:#F7FAFF}}
+.hdr{{font-size:12px;font-weight:700;margin-bottom:6px;opacity:.8}}
+.hdr .u{{color:#1f2937}}
+.hdr .a{{color:#0f766e}}
+
+/* Markdown readability */
+.markdown-body {{ width:100%; word-break: normal; overflow-wrap: break-word; hyphens: auto; }}
+.markdown-body h1,.markdown-body h2,.markdown-body h3{{margin-top:1.1rem}}
+.markdown-body p,.markdown-body li{{line-height:1.6}}
+.markdown-body table{{width:100%;border-collapse:collapse}}
+.markdown-body th,.markdown-body td{{border:1px solid #e5e7eb;padding:8px;font-size:14px}}
+.markdown-body th{{background:#f9fafb}}
+
+/* Buttons / chips */
+.stButton > button[kind="primary"] {{ background:{BRAND_PRIMARY}; border-color:{BRAND_PRIMARY}; }}
+.stButton > button {{ border-radius:14px !important; }}
+
+/* Layout padding (leave space for sticky input) */
+section.main > div.block-container {{ padding-top: 0.8rem; padding-bottom: 5rem; }}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -50,7 +72,7 @@ if "user_id" not in st.session_state: st.session_state.user_id = ""
 if "history" not in st.session_state: st.session_state.history: List[Dict[str,str]] = []
 if "last_answer" not in st.session_state: st.session_state.last_answer: RegulAIteAnswer|None = None
 
-# -------------------- Rendering helpers (display-only; safe) --------------------
+# -------------------- Helpers (display-only; safe) --------------------
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -135,28 +157,58 @@ def render_message(role: str, md: str, meta: str = ""):
 def _ts() -> str:
     return time.strftime("%H:%M")
 
-# -------------------- Login (unchanged) --------------------
+# -------------------- Login (UI refreshed; logic unchanged) --------------------
 def auth_ui():
-    st.markdown("## 🔐 RegulAIte Login")
-    with st.form("login_form"):
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        if st.form_submit_button("Login"):
-            if PRESET_USERS.get(u) == p:
-                st.session_state.auth_ok = True
-                st.session_state.user_id = u
-                st.session_state.history = load_chat(u)
-                st.success(f"Welcome {u}!")
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
+    with st.container():
+        cols = st.columns([1, 5, 1])
+        with cols[1]:
+            st.markdown('<div class="kh-header">', unsafe_allow_html=True)
+            if os.path.exists(LOGO_PATH):
+                st.image(LOGO_PATH, width=140)
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='kh-title' style='text-align:center;margin-top:8px;'>Khaleeji • RegulAIte</div>"
+                f"<div class='kh-subtitle' style='text-align:center;'>Secure login</div>",
+                unsafe_allow_html=True,
+            )
+            with st.form("login_form"):
+                u = st.text_input("Username")
+                p = st.text_input("Password", type="password")
+                if st.form_submit_button("Sign in"):
+                    if PRESET_USERS.get(u) == p:
+                        st.session_state.auth_ok = True
+                        st.session_state.user_id = u
+                        st.session_state.history = load_chat(u)
+                        st.success(f"Welcome {u}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
 
 if not st.session_state.auth_ok:
     auth_ui(); st.stop()
 
 USER = st.session_state.user_id
 
-# -------------------- Sidebar (unchanged) --------------------
+# -------------------- Header --------------------
+with st.container():
+    hcol1, hcol2 = st.columns([1, 10])
+    with hcol1:
+        if os.path.exists(LOGO_PATH):
+            st.image(LOGO_PATH, width=80)
+    with hcol2:
+        st.markdown(
+            f"""
+            <div class="kh-header">
+              <div>
+                <div class="kh-title">Khaleeji • RegulAIte</div>
+                <div class="kh-subtitle">Regulatory assistant (pilot)</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+# -------------------- Sidebar (status only) --------------------
 with st.sidebar:
     st.header("Session")
     c1, c2 = st.columns(2)
@@ -174,19 +226,12 @@ with st.sidebar:
     st.markdown("---")
     st.header("Status")
     st.markdown(
-        f'<span class="badge {"ok" if VECTOR_STORE_ID else "warn"}">Vector store: {"connected" if VECTOR_STORE_ID else "not connected"}</span> '
-        f'<span class="badge {"ok" if LLM_KEY_AVAILABLE else "err"}">LLM API key: {"available" if LLM_KEY_AVAILABLE else "missing"}</span>',
+        f'<span class="badge">{"Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected"}</span> '
+        f'<span class="badge">{"LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing"}</span>',
         unsafe_allow_html=True
     )
 
-# -------------------- Main (baseline preserved) --------------------
-st.markdown(f"## {APP_NAME}")
-
-first_q = st.text_input(
-    "Ask a question",
-    placeholder="e.g., CBB disclosure requirements for large exposures (compare with Basel)?",
-)
-
+# -------------------- Query execution (logic unchanged) --------------------
 def run_query(q: str):
     if not q.strip(): return
     # avoid accidental double-submit
@@ -220,34 +265,13 @@ def run_query(q: str):
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
-# Top Ask button (kept)
-cbtn, _ = st.columns([1,6])
-with cbtn:
-    if st.button("Ask", type="primary", use_container_width=True) and first_q:
-        run_query(first_q)
-
-# Render chat
+# -------------------- Chat stream --------------------
+# Title removed here (header already shows branding)
 for turn in st.session_state.history:
     clean = _normalize_to_markdown(turn["content"])
     render_message(turn["role"], clean, turn.get("meta",""))
 
-# -------------------- Always-available input (two ways) --------------------
-# 1) Sticky chat composer (Enter or send icon)
-follow_q = st.chat_input("Type a follow-up…", key="followup_chat")
-if follow_q:
-    run_query(follow_q)
-    st.rerun()
-
-# 2) Backup mini form (click button) – some browsers block chat_input; this guarantees a working path.
-with st.container():
-    with st.form("follow_form", clear_on_submit=True):
-        fq = st.text_input("Ask another question", placeholder="Or type your next question here…", label_visibility="collapsed")
-        send = st.form_submit_button("Send", use_container_width=True)
-        if send and fq:
-            run_query(fq)
-            st.rerun()
-
-# Simple follow-up chips (unchanged behavior)
+# -------------------- Follow-up chips (always show a few) --------------------
 def render_followups():
     suggs = [
         "Board approval thresholds for large exposures",
@@ -265,4 +289,11 @@ def render_followups():
                 run_query(s)
                 st.rerun()
 
+# Show chips below the last answer (or even at start)
 render_followups()
+
+# -------------------- Single sticky chat input (only one bar) --------------------
+prompt = st.chat_input("Type your question…")
+if prompt:
+    run_query(prompt)
+    st.rerun()
