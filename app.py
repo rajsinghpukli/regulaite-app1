@@ -21,7 +21,7 @@ PRESET_USERS = {"guest1": "pass1", "guest2": "pass2", "guest3": "pass3"}
 BRAND_BG = "#EAF3FF"       # Light blue bg
 BRAND_PRIMARY = "#0C5ECD"  # Accent
 BRAND_DARK = "#2A2F36"     # Headings
-LOGO_PATH = "rag/assets/khaleeji_logo.png"
+LOGO_PATH = "rag/khaleeji_logo.png"
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
@@ -297,3 +297,4 @@ prompt = st.chat_input("Type your question…")
 if prompt:
     run_query(prompt)
     st.rerun()
+
