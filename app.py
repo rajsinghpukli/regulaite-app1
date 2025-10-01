@@ -15,32 +15,39 @@ DEFAULT_MODEL = os.getenv("RESPONSES_MODEL", "gpt-4.1-mini")
 VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 LLM_KEY_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
 
-PRESET_USERS = {"guest1": "pass1", "guest2": "pass2", "guest3": "pass3"}
+# ---- Updated preset users ----
+PRESET_USERS = {
+    "user1@khaleeji": "abcd@1234",
+    "user2@khaleeji": "abcd@1234",
+    "user3@khaleeji": "abcd@1234",
+}
 
-# ---------- Branding ----------
-BRAND_BG = "#EAF3FF"       # Light blue bg
-BRAND_PRIMARY = "#0C5ECD"  # Accent
-BRAND_DARK = "#2A2F36"     # Headings
+# ---- Branding / assets ----
+BRAND_BG = "#EAF3FF"       # light blue
+BRAND_PRIMARY = "#0C5ECD"  # accent
+BRAND_DARK = "#2A2F36"     # headings
+
+# If your image is in rag/assets/khaleeji_logo.png, change this to that exact path.
 LOGO_PATH = "rag/khaleeji_logo.png"
+
+# Logo sizes
+LOGIN_LOGO_WIDTH = 180   # bigger on login
+HEADER_LOGO_WIDTH = 120  # bigger on page header
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
 # -------------------- Styles (display-only) --------------------
 CSS = f"""
 <style>
-/* Page background + container width */
 .stApp {{ background:{BRAND_BG}; }}
 .block-container {{ max-width: 1180px; }}
 
-/* Header */
-.kh-header {{ display:flex; align-items:center; gap:12px; padding:8px 0 14px 0; }}
-.kh-title {{ font-size:26px; font-weight:700; color:{BRAND_DARK}; letter-spacing:.2px; }}
+.kh-header {{ display:flex; align-items:center; gap:14px; padding:6px 0 12px 0; }}
+.kh-title {{ font-size:28px; font-weight:800; color:{BRAND_DARK}; letter-spacing:.2px; }}
 .kh-subtitle {{ color:#5a6473; font-size:13px; margin-top:-4px; }}
 
-/* Sidebar status pills */
 .badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;margin-right:6px;border:1px solid #C9E0FF;background:#E7F2FF;color:#164C96}}
 
-/* Chat bubbles */
 .regu-msg{{border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px #0001;border:1px solid #0001;margin-bottom:12px;background:#ffffffcc}}
 .regu-user{{background:#FFFFFF}}
 .regu-assistant{{background:#F7FAFF}}
@@ -48,7 +55,6 @@ CSS = f"""
 .hdr .u{{color:#1f2937}}
 .hdr .a{{color:#0f766e}}
 
-/* Markdown readability */
 .markdown-body {{ width:100%; word-break: normal; overflow-wrap: break-word; hyphens: auto; }}
 .markdown-body h1,.markdown-body h2,.markdown-body h3{{margin-top:1.1rem}}
 .markdown-body p,.markdown-body li{{line-height:1.6}}
@@ -56,11 +62,9 @@ CSS = f"""
 .markdown-body th,.markdown-body td{{border:1px solid #e5e7eb;padding:8px;font-size:14px}}
 .markdown-body th{{background:#f9fafb}}
 
-/* Buttons / chips */
 .stButton > button[kind="primary"] {{ background:{BRAND_PRIMARY}; border-color:{BRAND_PRIMARY}; }}
 .stButton > button {{ border-radius:14px !important; }}
 
-/* Layout padding (leave space for sticky input) */
 section.main > div.block-container {{ padding-top: 0.8rem; padding-bottom: 5rem; }}
 </style>
 """
@@ -72,7 +76,7 @@ if "user_id" not in st.session_state: st.session_state.user_id = ""
 if "history" not in st.session_state: st.session_state.history: List[Dict[str,str]] = []
 if "last_answer" not in st.session_state: st.session_state.last_answer: RegulAIteAnswer|None = None
 
-# -------------------- Helpers (display-only; safe) --------------------
+# -------------------- Helpers (display-only) --------------------
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -157,14 +161,14 @@ def render_message(role: str, md: str, meta: str = ""):
 def _ts() -> str:
     return time.strftime("%H:%M")
 
-# -------------------- Login (UI refreshed; logic unchanged) --------------------
+# -------------------- Login (bigger logo; logic unchanged) --------------------
 def auth_ui():
     with st.container():
         cols = st.columns([1, 5, 1])
         with cols[1]:
-            st.markdown('<div class="kh-header">', unsafe_allow_html=True)
-            if os.path.exists(LOGO_PATH):
-                st.image(LOGO_PATH, width=140)
+            st.markdown('<div class="kh-header" style="justify-content:center;">', unsafe_allow_html=True)
+            if os.path.exists(LOGO_PATH) or LOGO_PATH.startswith("http"):
+                st.image(LOGO_PATH, width=LOGIN_LOGO_WIDTH)
             st.markdown("</div>", unsafe_allow_html=True)
             st.markdown(
                 f"<div class='kh-title' style='text-align:center;margin-top:8px;'>Khaleeji • RegulAIte</div>"
@@ -189,12 +193,12 @@ if not st.session_state.auth_ok:
 
 USER = st.session_state.user_id
 
-# -------------------- Header --------------------
+# -------------------- Header (bigger logo) --------------------
 with st.container():
     hcol1, hcol2 = st.columns([1, 10])
     with hcol1:
-        if os.path.exists(LOGO_PATH):
-            st.image(LOGO_PATH, width=80)
+        if os.path.exists(LOGO_PATH) or LOGO_PATH.startswith("http"):
+            st.image(LOGO_PATH, width=HEADER_LOGO_WIDTH)
     with hcol2:
         st.markdown(
             f"""
@@ -231,10 +235,9 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# -------------------- Query execution (logic unchanged) --------------------
+# -------------------- Query execution (unchanged) --------------------
 def run_query(q: str):
     if not q.strip(): return
-    # avoid accidental double-submit
     if st.session_state.history and st.session_state.history[-1]["role"] == "user" \
        and st.session_state.history[-1]["content"].strip() == q.strip():
         return
@@ -265,13 +268,12 @@ def run_query(q: str):
     st.session_state.last_answer = ans
     save_chat(USER, st.session_state.history)
 
-# -------------------- Chat stream --------------------
-# Title removed here (header already shows branding)
+# -------------------- Render existing chat --------------------
 for turn in st.session_state.history:
     clean = _normalize_to_markdown(turn["content"])
     render_message(turn["role"], clean, turn.get("meta",""))
 
-# -------------------- Follow-up chips (always show a few) --------------------
+# -------------------- Follow-up chips (kept) --------------------
 def render_followups():
     suggs = [
         "Board approval thresholds for large exposures",
@@ -289,12 +291,10 @@ def render_followups():
                 run_query(s)
                 st.rerun()
 
-# Show chips below the last answer (or even at start)
 render_followups()
 
-# -------------------- Single sticky chat input (only one bar) --------------------
+# -------------------- Single sticky input --------------------
 prompt = st.chat_input("Type your question…")
 if prompt:
     run_query(prompt)
     st.rerun()
-
