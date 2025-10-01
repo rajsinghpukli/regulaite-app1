@@ -123,8 +123,8 @@ def _responses_try_file_search(query: str, sys_inst: str, style_msg: str, convo_
                 "attachments": [{"vector_store_id": vector_store_id}],
             }],
             tools=[{"type": "file_search"}],
-            temperature=0.35,
-            top_p=0.95,
+            temperature=1,
+            top_p=1,
             max_output_tokens= _mode_tokens("long"),
         )
     except Exception:
@@ -262,10 +262,11 @@ def ask(
                 lines.append(f"{i}. {title} — {url}\n   Snippet: {snippet}")
             web_context = "\n".join(lines)
 
+     #{"role": "system", "content": FEW_SHOT_EXAMPLE},
     messages = [
         {"role": "system", "content": sys_inst},
         {"role": "system", "content": STYLE_GUIDE},
-        {"role": "system", "content": FEW_SHOT_EXAMPLE},
+       
         {"role": "system", "content": style_msg},
         {"role": "user", "content": f"Conversation so far (brief):\n{convo_brief}"},
     ]
@@ -278,8 +279,8 @@ def ask(
     try:
         resp = client.chat.completions.create(
             model=chat_model,
-            temperature=0.35,
-            top_p=0.95,
+            temperature=1,
+            top_p=1,
             max_tokens=max_out,
             messages=messages,
         )
@@ -317,3 +318,4 @@ def ask(
         ]
 
     return ans
+
