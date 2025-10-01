@@ -14,6 +14,7 @@ if __name__ == "__main__":
         mode_hint="research",
         web_enabled=False,
         vec_id=os.getenv("OPENAI_VECTOR_STORE_ID"),
-        model=os.getenv("RESPONSES_MODEL", "gpt-4.1-mini"),
+        model=os.getenv("RESPONSES_MODEL", "gpt-4.1"),
     )
     print(json.dumps(ans.model_dump(), indent=2, ensure_ascii=False))
+
