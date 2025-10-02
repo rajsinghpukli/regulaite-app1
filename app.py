@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, re, time, json
 from typing import Any, Dict, List
+from datetime import datetime
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -161,6 +162,44 @@ def render_message(role: str, md: str, meta: str = ""):
 def _ts() -> str:
     return time.strftime("%H:%M")
 
+# ---- NEW: export helpers ----
+def _latest_assistant_md() -> str:
+    """Return the most recent assistant message as clean markdown."""
+    for t in reversed(st.session_state.history):
+        if t.get("role") == "assistant":
+            return _normalize_to_markdown(t.get("content", ""))
+    return ""
+
+def _chat_history_as_markdown() -> str:
+    """Readable Markdown export of the whole conversation."""
+    parts = []
+    for t in st.session_state.history:
+        role = t.get("role", "assistant").title()
+        content = _normalize_to_markdown(t.get("content", ""))
+        timestamp = t.get("meta", "")
+        header = f"### {role} {f'({timestamp})' if timestamp else ''}"
+        parts.append(f"{header}\n\n{content}\n")
+    return "\n\n".join(parts).strip()
+
+def _last_answer_as_html() -> str:
+    """Wrap the last assistant answer in a basic HTML page for easy Print-to-PDF."""
+    md = _latest_assistant_md()
+    safe = md.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>RegulAIte Answer</title>
+<style>
+body {{ font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 24px; }}
+pre, code {{ background:#f6f8fa; padding:2px 4px; border-radius:4px; }}
+table {{ border-collapse: collapse; width:100%; }}
+th, td {{ border:1px solid #e5e7eb; padding:8px; }}
+h1, h2, h3 {{ margin-top:1.2em; }}
+</style>
+</head><body>
+<pre style="white-space:pre-wrap;word-wrap:break-word;">{safe}</pre>
+</body></html>"""
+
 # -------------------- Login (bigger logo; logic unchanged) --------------------
 def auth_ui():
     with st.container():
@@ -212,7 +251,7 @@ with st.container():
             unsafe_allow_html=True,
         )
 
-# -------------------- Sidebar (status only) --------------------
+# -------------------- Sidebar (session + exports; no status) --------------------
 with st.sidebar:
     st.header("Session")
     c1, c2 = st.columns(2)
@@ -227,13 +266,52 @@ with st.sidebar:
             st.session_state.auth_ok=False
             st.session_state.user_id=""
             st.rerun()
+
     st.markdown("---")
-    st.header("Status")
-    st.markdown(
-        f'<span class="badge">{"Vector store: connected" if VECTOR_STORE_ID else "Vector store: not connected"}</span> '
-        f'<span class="badge">{"LLM API key: available" if LLM_KEY_AVAILABLE else "LLM API key: missing"}</span>',
-        unsafe_allow_html=True
+    st.header("Export")
+
+    # Latest answer downloads
+    last_md = _latest_assistant_md()
+    if last_md:
+        fname_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        st.download_button(
+            "⬇️ Download last answer (Markdown)",
+            data=last_md,
+            file_name=f"regulaite_answer_{fname_stamp}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+        last_html = _last_answer_as_html()
+        st.download_button(
+            "⬇️ Download last answer (HTML)",
+            data=last_html,
+            file_name=f"regulaite_answer_{fname_stamp}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+
+    # Full chat history download (JSON)
+    hist_json = json.dumps(st.session_state.history, ensure_ascii=False, indent=2)
+    st.download_button(
+        "⬇️ Download chat history (JSON)",
+        data=hist_json,
+        file_name=f"regulaite_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        use_container_width=True,
     )
+
+    # Optional: Markdown export of full chat
+    chat_md = _chat_history_as_markdown()
+    if chat_md:
+        st.download_button(
+            "⬇️ Download chat (Markdown)",
+            data=chat_md,
+            file_name=f"regulaite_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
 
 # -------------------- Query execution (unchanged) --------------------
 def run_query(q: str):
