@@ -27,13 +27,11 @@ PRESET_USERS = {
 BRAND_BG = "#EAF3FF"       # light blue
 BRAND_PRIMARY = "#0C5ECD"  # accent
 BRAND_DARK = "#2A2F36"     # headings
-
-# If your image is in rag/assets/khaleeji_logo.png, change this to that exact path.
-LOGO_PATH = "rag/khaleeji_logo.png"
+LOGO_PATH = "rag/khaleeji_logo.png"  # adjust if your path differs
 
 # Logo sizes
-LOGIN_LOGO_WIDTH = 180   # bigger on login
-HEADER_LOGO_WIDTH = 120  # bigger on page header
+LOGIN_LOGO_WIDTH = 180
+HEADER_LOGO_WIDTH = 120
 
 st.set_page_config(page_title=APP_NAME, page_icon="🧭", layout="wide")
 
@@ -76,6 +74,7 @@ if "auth_ok" not in st.session_state: st.session_state.auth_ok = False
 if "user_id" not in st.session_state: st.session_state.user_id = ""
 if "history" not in st.session_state: st.session_state.history: List[Dict[str,str]] = []
 if "last_answer" not in st.session_state: st.session_state.last_answer: RegulAIteAnswer|None = None
+if "answer_length" not in st.session_state: st.session_state.answer_length = "Medium"  # Short | Medium | Long
 
 # -------------------- Helpers (display-only) --------------------
 def _strip_code_fences(s: str) -> str:
@@ -164,14 +163,12 @@ def _ts() -> str:
 
 # ---- NEW: export helpers ----
 def _latest_assistant_md() -> str:
-    """Return the most recent assistant message as clean markdown."""
     for t in reversed(st.session_state.history):
         if t.get("role") == "assistant":
             return _normalize_to_markdown(t.get("content", ""))
     return ""
 
 def _chat_history_as_markdown() -> str:
-    """Readable Markdown export of the whole conversation."""
     parts = []
     for t in st.session_state.history:
         role = t.get("role", "assistant").title()
@@ -182,7 +179,6 @@ def _chat_history_as_markdown() -> str:
     return "\n\n".join(parts).strip()
 
 def _last_answer_as_html() -> str:
-    """Wrap the last assistant answer in a basic HTML page for easy Print-to-PDF."""
     md = _latest_assistant_md()
     safe = md.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"""<!doctype html>
@@ -270,7 +266,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("Export")
 
-    # Latest answer downloads
     last_md = _latest_assistant_md()
     if last_md:
         fname_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -292,7 +287,6 @@ with st.sidebar:
             use_container_width=True,
         )
 
-    # Full chat history download (JSON)
     hist_json = json.dumps(st.session_state.history, ensure_ascii=False, indent=2)
     st.download_button(
         "⬇️ Download chat history (JSON)",
@@ -302,7 +296,6 @@ with st.sidebar:
         use_container_width=True,
     )
 
-    # Optional: Markdown export of full chat
     chat_md = _chat_history_as_markdown()
     if chat_md:
         st.download_button(
@@ -313,12 +306,47 @@ with st.sidebar:
             use_container_width=True,
         )
 
-# -------------------- Query execution (unchanged) --------------------
+    # -------- Answer length control --------
+    st.markdown("---")
+    st.header("Answer length")
+    st.session_state.answer_length = st.radio(
+        "Choose verbosity",
+        options=["Short", "Medium", "Long"],
+        index=["Short","Medium","Long"].index(st.session_state.answer_length),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+# -------------------- Query execution --------------------
 def run_query(q: str):
     if not q.strip(): return
     if st.session_state.history and st.session_state.history[-1]["role"] == "user" \
        and st.session_state.history[-1]["content"].strip() == q.strip():
         return
+
+    # Map UI choice to pipeline mode_hint
+    length_choice = st.session_state.answer_length
+    if length_choice == "Short":
+        mode_for_pipeline = "short"
+    elif length_choice == "Long":
+        mode_for_pipeline = "research"
+    else:
+        mode_for_pipeline = "long"
+
+    # Only add a gentle length note if it won't break strict return-only prompts
+    ql = q.lower()
+    is_strict = any(k in ql for k in [
+        "return only", "only the", "only:", "just the", "quote verbatim",
+        "verbatim", "exact sentence", "exact line", "ids only", "url only", "nothing else"
+    ])
+
+    q2 = q
+    if not is_strict:
+        if length_choice == "Short":
+            q2 = q + "\n\n(Please answer concisely in 4–7 bullets or ~120–180 words.)"
+        elif length_choice == "Long":
+            q2 = q + "\n\n(Provide a comprehensive, board-ready answer with clear sectioning. Be thorough.)"
+        # Medium: no extra note
 
     append_turn(USER, "user", q)
     st.session_state.history.append({"role": "user", "content": q, "meta": _ts()})
@@ -327,12 +355,12 @@ def run_query(q: str):
     with st.spinner("Thinking…"):
         try:
             ans: RegulAIteAnswer = ask(
-                query=q,
+                query=q2,
                 user_id=USER,
                 history=st.session_state.history,
                 k_hint=12,
                 evidence_mode=True,
-                mode_hint="long",
+                mode_hint=mode_for_pipeline,
                 web_enabled=True,
                 vec_id=VECTOR_STORE_ID or None,
                 model=DEFAULT_MODEL,
